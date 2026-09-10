@@ -27,6 +27,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description="RAG retrieval-time poisoning detector",
     )
     parser.add_argument("--version", action="version", version=f"toxindb {__version__}")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run the offline demo (alias for the 'demo' subcommand)")
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--output", type=str, default="./reports")
@@ -232,6 +234,10 @@ def cmd_demo(args) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--demo" in argv:
+        argv.remove("--demo")
+        argv.insert(0, "demo")
     parser = _build_parser()
     args = parser.parse_args(argv)
 

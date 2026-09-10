@@ -35,6 +35,16 @@ def test_cli_demo(tmp_path):
     assert (tmp_path / "demo_summary.json").exists()
 
 
+def test_cli_demo_global_includes_demo_subcommand():
+    assert "--demo" in _build_parser().format_help()
+
+
+def test_cli_demo_global_flag(tmp_path):
+    rc = main(["--demo", "--output", str(tmp_path)])
+    assert rc == 0
+    assert (tmp_path / "demo_summary.json").exists()
+
+
 def test_cli_monitor(tmp_path):
     path = _make_trace_file(generate_clean_trace())
     alerts_dir = tmp_path / "alerts"
