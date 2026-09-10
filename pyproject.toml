@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toxindb"
+version = "1.0.0"
+description = "RAG retrieval-time poisoning detector for vector database security"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "5h4d0wn1k", email = "5h4d0wn1k@users.noreply.github.com" }]
+keywords = ["security", "rag", "vector-database", "poisoning", "ai-security", "defensive"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+
+[project.scripts]
+toxindb = "toxindb.cli:main"
+
+[tool.setuptools]
+packages = ["toxindb"]
+
+[tool.setuptools.package-data]
+toxindb = ["../examples/traces/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
