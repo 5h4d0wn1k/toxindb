@@ -544,6 +544,7 @@ def extract_shell_blocks(
     # contain no non-shell fences.
     in_block = False
     ignoring = ""
+    ignoring_start = 0
     shell = False
     fence = ""
     start = 0
@@ -568,7 +569,11 @@ def extract_shell_blocks(
             shell = _is_shell_info(info) if info else False
             if not shell and not plain:
                 # An explicitly non-shell fence (python, json, text, ...).
+                # `ignoring_start` is kept because the unterminated report below
+                # names this fence's line. Reusing `start` for it pointed the
+                # error at line 0, which is not a line in the document.
                 ignoring = fence_match.group("ticks")[0]
+                ignoring_start = number
                 continue
             in_block = True
             fence = fence_match.group("ticks")[0]
@@ -603,9 +608,10 @@ def extract_shell_blocks(
         # Same class of defect, in the fence we are deliberately not reading.
         # Reported, because a `python` block left open would hide the rest of
         # the document just as thoroughly.
-        unterminated.append(start)
+        unterminated.append(ignoring_start)
         print(
-            f"::error::{start}: non-shell code fence opened here is never closed",
+            f"::error::{ignoring_start}: non-shell code fence opened here is "
+            f"never closed",
             file=sys.stderr,
         )
     return shell_blocks, unlabelled, unterminated

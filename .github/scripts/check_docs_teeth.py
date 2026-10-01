@@ -244,6 +244,30 @@ STRUCTURAL = [
         readme("toxindb --version"),
         0,
     ),
+    # A non-shell block left open is a failure too, and it is the other half of
+    # the defect above. Its error line was reported as `0` for a while, because
+    # the report reused the shell-block's start offset -- and an error naming
+    # line 0 is worse than no error, since it points nowhere. This one lives
+    # away from line 1 so that a regression to `start` would be visible.
+    Case(
+        "an unterminated non-shell fence is a failure, at the right line",
+        "# Synthetic\n\nProse.\n\n```python\nprint(1)\n",
+        1,
+        expect="::error::5: non-shell code fence opened here is never closed",
+    ),
+    # Tilde fences are CommonMark-valid and must be honoured, or a documented
+    # `~~~bash` block would go unchecked with no error.
+    Case(
+        "a tilde-fenced bash block is executed",
+        "# Synthetic\n\n~~~bash\ntoxindb nosuchsubcommand\n~~~\n",
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "a tilde-fenced non-shell block is consumed, not read as unlabelled",
+        "# Synthetic\n\n~~~python\nprint(1)\n~~~\n\n```bash\ntoxindb --version\n```\n",
+        0,
+    ),
 ]
 
 # --------------------------------------------------------------------------
