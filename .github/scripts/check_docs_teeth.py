@@ -64,6 +64,15 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CHECK = HERE / "check_docs_commands.py"
 
+
+class MutationFailed(Exception):
+    """The setup for a check could not be built, so the check cannot run.
+
+    Deliberately its own type rather than an `AssertionError`. A check that
+    cannot run and a check that failed look the same in the output, and only one
+    of them means the gate is broken; `main` reports the two differently.
+    """
+
 # Substrings the gate prints when it reached a verdict, as opposed to crashing.
 # A verdict is either a failing documented command or a named structural
 # complaint about the document.
@@ -118,9 +127,23 @@ QUOTED_COMMAND_LINE = 8        # the first command inside `> ```bash`
 # never fire. The gate runs documented commands in a `TemporaryDirectory` that
 # it removes before returning, so any file a substitution created was deleted
 # before the check looked for it -- an assertion that was incapable of failing
-# and therefore proved nothing. Verified: reintroducing the argv-to-shell-string
-# regression below creates this marker and the check catches it, where the
-# relative version stayed green.
+# and therefore proved nothing.
+#
+# The marker is at an absolute path in the *teeth* script's own directory rather
+# than in the gate's, so a substitution that runs leaves evidence behind. It is a
+# belt-and-braces check on top of the syntax guard, and the two layers were
+# verified independently rather than assumed:
+#
+#   * removing the substitution rules from `_SHELL_SYNTAX` *and* restoring
+#     `shell=True` with a joined argv makes the marker fire, and the suite goes
+#     red naming the file it created;
+#   * restoring `shell=True` alone does NOT fire it, because `shell_syntax_reason`
+#     still refuses the line before `subprocess.run` is reached. The previous
+#     version of this comment credited the marker with catching the
+#     shell-regression alone, which is not what happens.
+#
+# So it is a real assertion -- `run_case` fails the case if the file exists
+# afterwards -- but it is reachable only when *both* layers are gone.
 NO_SIDE_EFFECT = "TEETH_SIDE_EFFECT_MARKER"
 
 
@@ -382,6 +405,36 @@ STRUCTURAL = [
         0,
         expect=f"PASS  README.md:{COMMAND_LINE}",
     ),
+    # A closing fence must be at least as long as the opener. Comparing only the
+    # fence *character* let a 3-backtick line close a 4-backtick ```bash block,
+    # so everything after it was read as document text -- no skip reason, no
+    # structural error, exit 0, and a documented `nosuchsubcommand` never run.
+    # Counted by hand from the markdown: 1 `# T`, 2 blank, 3 ````bash opener,
+    # 4 the good command, 5 the short closer, 6 the hidden bad command.
+    Case(
+        "a short closer does not close a longer opener",
+        "# Synthetic\n\n````bash\ntoxindb --version\n```\n"
+        "toxindb nosuchsubcommand\n`````\n",
+        1,
+        expect=f"FAIL  README.md:6     toxindb nosuchsubcommand",
+    ),
+    # The other half, and the reason it needed two cases: with no real closer at
+    # all the block *looked* closed, so no unclosed-fence error was printed
+    # either. A structure the parser rejects should say so, not just fail.
+    Case(
+        "a short closer is also reported as an unclosed fence",
+        "# Synthetic\n\n````bash\ntoxindb --version\n```\n",
+        1,
+        expect="::error::3: code fence opened here is never closed",
+    ),
+    # The control, so the fix is not simply "always require four backticks": a
+    # longer closer than the opener is legal and must still close the block.
+    Case(
+        "a longer closer than the opener still closes it",
+        "# Synthetic\n\n```bash\ntoxindb --version\n`````\n",
+        0,
+        expect=f"PASS  README.md:4     toxindb --version",
+    ),
 ]
 
 # --------------------------------------------------------------------------
@@ -434,8 +487,113 @@ def run_gate(markdown: str, workdir: Path) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def _temp_leftovers(root: Path) -> list[str]:
-    return [str(p.relative_to(root)) for p in root.rglob(NO_SIDE_EFFECT)]
+# --------------------------------------------------------------------------
+# The working-tree safety net
+# --------------------------------------------------------------------------
+#
+# `_tree_state` is the only evidence that running the documented commands did
+# not rewrite the repository's own fixtures, and nothing above exercises it:
+# `run_case` hands the gate a scratch directory with no `.git`, so the
+# assertion is legitimately skipped in all 29 cases. Neutralising the function
+# entirely left this script green, which is how a docstring came to claim a
+# verification nobody had run.
+#
+# Called directly against real checkouts rather than through `run_gate`, because
+# the property is about `git status` and about which failures are silent -- and
+# a scratch directory cannot express either.
+
+_GATE: object | None = None
+
+
+def _gate() -> object:
+    """Import check_docs_commands.py so its internals can be called directly."""
+    global _GATE
+    if _GATE is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "docs_gate_under_test", HERE / "check_docs_commands.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _GATE = module
+    return _GATE
+
+
+def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise MutationFailed(f"`git` is not on PATH ({exc}); this check cannot run") from exc
+
+
+def check_tree_state() -> list[str]:
+    """Prove `_tree_state` reports a change, and stays quiet about a non-checkout.
+
+    Five properties. The two that matter most are the first and the third: a
+    gate that cannot see a write, and a gate that reports one it cannot see.
+    """
+    problems: list[str] = []
+    gate = _gate()
+    results: list[tuple[str, bool, str]] = []
+
+    with tempfile.TemporaryDirectory(prefix="docs-tree-") as tmp:
+        outside = Path(tmp)
+        checkout = outside / "checkout"
+        checkout.mkdir()
+        init = _git(["git", "init", "-q"], checkout)
+        if init.returncode != 0:
+            raise MutationFailed(f"`git init` failed: {init.stderr.strip()}")
+
+        before = gate._tree_state(checkout)
+        # A file git already tracks, plus a new untracked one: both must show.
+        (checkout / "TREE_PROBE.txt").write_text("x", encoding="utf-8")
+        after_new_file = gate._tree_state(checkout)
+        same = gate._tree_state(checkout)
+        (checkout / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        (checkout / "ignored.txt").write_text("secret", encoding="utf-8")
+        after_ignored = gate._tree_state(checkout)
+
+        results.append(("a new untracked file changes the snapshot",
+                        before != after_new_file, "expected a difference"))
+        results.append(("an unchanged tree yields an identical snapshot",
+                        after_new_file == same, "expected no difference"))
+        results.append(("a file inside an ignored directory is still listed",
+                        after_ignored != same, "expected a difference"))
+
+        # Not a checkout: skipped with a note, never silently assumed to have
+        # passed. `_tree_state` returns None for this and for nothing else.
+        plain = outside / "plain"
+        plain.mkdir()
+        results.append(("a directory with no .git anywhere is skipped",
+                        gate._tree_state(plain) is None, "expected None"))
+
+        # Git present, in a real checkout, and failing. This used to be reported
+        # as the "not a git checkout" skip, which is the opposite of the truth
+        # and left the only tree assertion in the gate switched off.
+        corrupt = outside / "corrupt"
+        corrupt.mkdir()
+        _git(["git", "init", "-q"], corrupt)
+        (corrupt / ".git" / "index").write_bytes(b"DIRC\0\0\0\0garbage")
+        try:
+            gate._tree_state(corrupt)
+            refused = False
+        except gate.GitRefused:
+            refused = True
+        except Exception as exc:  # noqa: BLE001 - wrong exception type is a failure
+            problems.append(
+                f"a corrupt index raised {type(exc).__name__} rather than "
+                f"GitRefused: the error type is what main() dispatches on"
+            )
+            refused = True
+        results.append(("a corrupt index in a checkout is refused, not skipped",
+                        refused, "expected GitRefused"))
+
+    for label, ok, why in results:
+        if not ok:
+            problems.append(f"{label}: {why}")
+        print(f"  {'ok' if ok else 'WRONG':>5}  {label}")
+    return problems
 
 
 def run_case(case: Case) -> str | None:
@@ -502,6 +660,16 @@ def main() -> int:
                 problems.append(f"{case.title}: {problem}")
                 print(f"  WRONG  {case.title} -> {problem}")
 
+    print(
+        "\nWorking-tree assertion -- called directly, because `run_case` hands "
+        "the gate a scratch directory with no `.git`, so all "
+        f"{total} cases above run with this assertion legitimately skipped:"
+    )
+    try:
+        problems.extend(check_tree_state())
+    except MutationFailed as exc:
+        problems.append(f"the working-tree assertion could not be checked: {exc}")
+
     print()
     if problems:
         print(
@@ -524,7 +692,8 @@ def main() -> int:
         f"The docs gate rejected {rejected} injected document defects, "
         f"correctly accepted {accepted_defects} well-formed document(s) it must "
         f"not reject, accepted {len(MUST_PASS)} good README(s), executed no "
-        f"command substitution, and did not confuse a crash with a verdict."
+        f"command substitution, saw a real tree change and refused a broken git "
+        f"instead of skipping on it, and did not confuse a crash with a verdict."
     )
     return 0
 

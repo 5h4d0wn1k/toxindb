@@ -653,7 +653,8 @@ def extract_shell_blocks(
             if (
                 fence_match
                 and fence_match.group("info") == ""
-                and fence_match.group("ticks")[0] == ignoring
+                and fence_match.group("ticks")[0] == ignoring[0]
+                and len(fence_match.group("ticks")) >= len(ignoring)
             ):
                 ignoring = ""
                 continue
@@ -695,16 +696,28 @@ def extract_shell_blocks(
                 # names this fence's line. Reusing `start` for it pointed the
                 # error at line 0, or at an unrelated block's line, neither of
                 # which is where the author has to look.
-                ignoring = fence_match.group("ticks")[0]
+                ignoring = fence_match.group("ticks")
                 ignoring_start = number
                 continue
             in_block = True
-            fence = fence_match.group("ticks")[0]
+            fence = fence_match.group("ticks")
             start, body = number, []
             continue
-        # Closing fence: same character, no info string.
+        # Closing fence: same character, no info string, and *at least* as long
+        # as the opener. CommonMark requires that last part, and comparing only
+        # the fence *character* is what let a 3-backtick line close a 4-backtick
+        # ```bash block: everything after it became ordinary document text, so a
+        # documented `toxindb nosuchsubcommand` was never run, never reported as
+        # skipped, and the job was green. Verified both ways -- with a bad
+        # command after the short closer the gate exited 0 with one command
+        # executed, and with no real closer at all it reported no unclosed-fence
+        # error, because the block looked closed.
         closing = _UNLABELLED.match(line)
-        if closing and closing.group("ticks")[0] == fence:
+        if (
+            closing
+            and closing.group("ticks")[0] == fence[0]
+            and len(closing.group("ticks")) >= len(fence)
+        ):
             (shell_blocks if shell else unlabelled).append((start, body))
             in_block = False
             fence, shell = "", False
@@ -832,7 +845,15 @@ def _main() -> int:
             file=sys.stderr,
         )
 
-    planned: list[tuple[int, str, list[list[str]] | None, dict[str, str], str | None]] = []
+    planned: list[
+        tuple[
+            int,
+            str,
+            list[tuple[str, list[str]]] | None,
+            dict[str, str],
+            str | None,
+        ]
+    ] = []
     for start, body in blocks:
         # `start` is the opening fence's line, so the first body line is start+1.
         for line_no, command in logical_commands(body, first_line=start + 1):
@@ -847,7 +868,19 @@ def _main() -> int:
                 # The argv is shown, not just "RUN": this is the view where a
                 # mis-parsed line is easiest to spot, and every command is
                 # executed with no shell.
-                rendered = " && ".join(" ".join(argv) for argv in steps or [])
+                #
+                # `steps` is a list of `(joiner, argv)` pairs, and the *joiner* is
+                # printed rather than assumed. This line iterated argv directly,
+                # which raised `TypeError: expected str instance, list found` on
+                # the first runnable command -- so `--list`, the mode
+                # `skip_reason`'s docstring nominates as the thing that "can never
+                # disagree with the executor", had never once run. Rendering the
+                # joiners also means the view cannot quietly claim a `||` chain
+                # is an `&&` chain, which is the same defect this round found in
+                # the executor.
+                rendered = " ".join(
+                    f"{joiner} {' '.join(argv)}".strip() for joiner, argv in steps or []
+                )
                 print(f"{f'RUN {rendered}':44} README.md:{line_no}  {command}")
         return 0
 

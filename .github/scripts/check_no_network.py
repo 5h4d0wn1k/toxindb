@@ -33,6 +33,21 @@ module that imports `socket`. Parsing with `ast` collects every alias of every
 `import` and `from` node regardless of formatting, so the shape of the source
 stops mattering.
 
+What it does not do
+-------------------
+It reads `import` statements. It does not follow them: `__import__("socket")`,
+`importlib.import_module("socket")`, `os.system("curl ...")`,
+`subprocess.run(["curl", ...])` and a base64-encoded payload all pass. That is a
+real limit and worth stating, because this gate is the only thing backing the
+offline promise. Catching those needs a different tool -- an import hook or a
+sandbox with no network namespace -- not a bigger regex, and the honest move is
+to say so rather than let a passing run imply more than it checked. A reader who
+knows this project's code should also know that adding a network client is a
+deletion-worthy change, because it will not be caught here.
+
+`NETWORK_MODULES` is likewise a floor and not a ceiling; see
+`REQUIRED_NETWORK_MODULES` for the part of it that is enforced.
+
 Usage
 -----
     python .github/scripts/check_no_network.py toxindb
@@ -64,17 +79,30 @@ from pathlib import Path
 # `http.client` names `http` at the top level; that is what this set matches on.
 # `asyncio` is here because `asyncio.open_connection` and the `*-connector`
 # helpers reach a socket, even though the name alone promises nothing.
+# Modules that can open a network connection, or that can be made to.
+#
+# `http` and `urllib` are packages rather than leaf modules, so importing
+# `http.client` names `http` at the top level; that is what this set matches on.
+# `asyncio` is here because `asyncio.open_connection` and the `*-connector`
+# helpers reach a socket, even though the name alone promises nothing.
 NETWORK_MODULES = frozenset(
     {
+        "aiohttp",
         "asyncio",
+        "boto3",
+        "botocore",
         "ftplib",
+        "grpc",
         "http",
+        "httpx",
         "imaplib",
         "nntplib",
+        "paramiko",
         "poplib",
         "requests",
         "smtplib",
         "socket",
+        "socks",
         "ssl",
         "telnetlib",
         "urllib",
@@ -82,6 +110,33 @@ NETWORK_MODULES = frozenset(
         "websockets",
         "xmlrpc",
     }
+)
+
+# The subset of `NETWORK_MODULES` that a well-known client library must be in.
+#
+# This exists because the previous list was never checked against anything. It
+# omitted `httpx`, `aiohttp`, `paramiko` and `boto3` -- and `ci.yml` justifies
+# this script as "the one place that promise could silently be broken by a
+# *future dependency*". Those four are what a future dependency looks like, so
+# the check missed exactly the case it was added for. Verified: with the old
+# list, `import httpx`, `from aiohttp import ClientSession` and `import
+# paramiko` all passed; only `import socket` was caught.
+#
+# An allowlist cannot be proven complete against an unbounded set of
+# third-party packages. What *can* be enforced is that the packages this
+# project would plausibly reach for are in it, and that nothing is added
+# wrongly -- `SELF_TEST_CASES` covers the second direction, since every one of
+# those must still be accepted. Stated as a floor, not a ceiling.
+REQUIRED_NETWORK_MODULES = (
+    "aiohttp",
+    "boto3",
+    "http",
+    "httpx",
+    "paramiko",
+    "requests",
+    "socket",
+    "ssl",
+    "urllib",
 )
 
 
@@ -151,10 +206,29 @@ SELF_TEST_CASES: tuple[tuple[str, str, bool], ...] = (
     ("aliased.py", "import socket as s\n", True),
     ("dotted.py", "import urllib.parse\n", True),
     # Not a network module, however it is spelled.
+    # The four real client libraries the previous list omitted. The CI comment
+    # calls this script "the one place that promise could silently be broken by
+    # a future dependency", and these are what a future dependency looks like.
+    ("httpx_client.py", "import httpx\n", True),
+    ("aiohttp_client.py", "from aiohttp import ClientSession\n", True),
+    ("paramiko_ssh.py", "import paramiko\n", True),
+    ("boto3_client.py", "import boto3\n", True),
+    # Lookalikes, which must stay accepted or the list grows by accident.
     ("lookalike.py", "import socket_helpers\nfrom sockets import bind\n", False),
     ("comment.py", "# import socket\n'''import ssl'''\n", False),
     ("string.py", 'PATH = "socket/host.py"\n', False),
 )
+
+
+def missing_required_modules() -> list[str]:
+    """Well-known network clients absent from `NETWORK_MODULES`.
+
+    This is the one direction a tree of synthetic files cannot check, because
+    every file it builds is written by this file -- widening the list wrongly is
+    caught, but narrowing it is invisible unless the reader already knows which
+    names matter. The names below are checked against the list directly instead.
+    """
+    return [name for name in REQUIRED_NETWORK_MODULES if name not in NETWORK_MODULES]
 
 
 def self_test() -> int:
@@ -167,6 +241,12 @@ def self_test() -> int:
     import tempfile
 
     problems: list[str] = []
+    for name in missing_required_modules():
+        problems.append(
+            f"NETWORK_MODULES no longer contains {name!r}, a well-known "
+            f"network client. Dropping a name is the silent direction: no "
+            f"synthetic file in this self-test would ever import it."
+        )
     with tempfile.TemporaryDirectory(prefix="toxindb-net-") as scratch:
         root = Path(scratch)
         for filename, source, _ in SELF_TEST_CASES:

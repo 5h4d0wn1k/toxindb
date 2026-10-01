@@ -376,10 +376,19 @@ def m_extra_output_file(repo: Path) -> None:
         "\n"
         "    results = {}\n"
     )
-    text = cli.read_text(encoding="utf-8")
+    # Both anchors must be *unique*, not merely present. This function used to
+    # check `needle in text` and then `replace(..., 1)`, so a second copy of
+    # either block introduced by an unrelated refactor moved the mutation
+    # somewhere else while the case kept printing this title -- which is the
+    # scenario Rule 2 documents as prevented. It fails loudly rather than
+    # silently, so the cost was a misleading label, not a false green.
     for needle in ("def cmd_demo", anchor):
-        if needle not in text:
-            raise MutationFailed(f"anchor not found in cli.py: {needle!r}")
+        if cli.read_text(encoding="utf-8").count(needle) != 1:
+            raise MutationFailed(
+                f"anchor occurs {cli.read_text(encoding='utf-8').count(needle)} "
+                f"time(s) in cli.py, expected exactly 1: {needle!r}"
+            )
+    text = cli.read_text(encoding="utf-8")
     text = text.replace("def cmd_demo", helper + "def cmd_demo", 1)
     text = text.replace(anchor, anchor + "\n    _teeth_emit(output_dir)\n", 1)
     cli.write_text(text, encoding="utf-8")
@@ -851,6 +860,111 @@ class Case:
         self.expect = expect
 
 
+# --------------------------------------------------------------------------
+# The working-tree safety net
+# --------------------------------------------------------------------------
+#
+# The end-to-end cases above copy the tree *without* `.git`, because a copy of
+# the checkout is what lets a mutation perturb the run rather than the
+# repository. That also means every one of those cases runs the gate with the
+# tree assertion legitimately skipped, so none of them can show whether it works.
+#
+# It matters because the demo resolves its fixtures through the *package*
+# directory, so a change that writes into the checkout is the exact failure the
+# assertion exists to catch -- and the docstring on that assertion claims it was
+# verified. Claim was not evidence: neutralising the comparison left this whole
+# script green.
+#
+# So it gets its own check, against a real `git init` checkout, and it is
+# asserted in both directions. Injecting a tree write and seeing rc=1 proves
+# little on its own -- the mutation could be breaking the demo for some other
+# reason and any non-zero exit would score the same. So the same mutation is
+# also applied with the comparison removed, and there it must exit 0. Only the
+# pair pins the red to the assertion.
+
+_TREE_WRITE_ANCHOR = "    output_dir = args.output\n    os.makedirs(output_dir, exist_ok=True)\n"
+_TREE_WRITE = "    open('TEETH_TREE_WRITE.json', 'w').write('x')\n"
+_TREE_ASSERTION = "    if before == after:\n        return 0\n"
+
+
+def _inject_tree_write(repo: Path) -> None:
+    cli = repo / "toxindb" / "cli.py"
+    _replace(cli, _TREE_WRITE_ANCHOR, _TREE_WRITE_ANCHOR + _TREE_WRITE)
+
+
+def _neutralise_tree_assertion(repo: Path) -> None:
+    _replace(
+        repo / ".github" / "scripts" / "check_demo_determinism.py",
+        _TREE_ASSERTION,
+        "    return 0  # teeth: tree assertion neutralised\n",
+    )
+
+
+def _git_init(repo: Path) -> list[str]:
+    """Make `repo` a real checkout, or explain why it is not one."""
+    try:
+        proc = subprocess.run(
+            ["git", "init", "-q"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise MutationFailed(f"`git` is not on PATH ({exc}); this check cannot run") from exc
+    if proc.returncode != 0:
+        raise MutationFailed(f"`git init` failed: {proc.stderr.strip()}")
+    return []
+
+
+def check_tree_assertion() -> list[str]:
+    """Prove the working-tree comparison is what catches a write into the tree.
+
+    Two runs, one mutation each. The second is the one that makes the first
+    mean something.
+    """
+    problems: list[str] = []
+    for label, neutralise, want in (
+        ("a write into the tree is caught", False, "nonzero"),
+        ("the same write is silent once the comparison is removed", True, "zero"),
+    ):
+        repo = _fresh_repo()
+        try:
+            _git_init(repo)
+            _inject_tree_write(repo)
+            if neutralise:
+                _neutralise_tree_assertion(repo)
+            rc, output = run_check(
+                repo, check=repo / ".github" / "scripts" / "check_demo_determinism.py"
+            )
+        except MutationFailed as exc:
+            problems.append(f"{label}: {exc}")
+            continue
+        finally:
+            shutil.rmtree(repo.parent, ignore_errors=True)
+        caught = rc != 0
+        if want == "nonzero" and not caught:
+            problems.append(
+                f"{label}: the gate exited 0 with a file written into the "
+                f"checkout, so the working-tree assertion is dead"
+            )
+        elif want == "zero" and caught:
+            problems.append(
+                f"{label}: the gate exited {rc} even with the comparison "
+                f"removed, so the run did not differ for the reason this check "
+                f"assumes. Output: {output.strip()[-400:]}"
+            )
+        if want == "nonzero" and caught and "modified the working tree" not in output:
+            problems.append(
+                f"{label}: the gate exited {rc} but did not say the tree "
+                f"changed, so a different check caught it"
+            )
+        verdict = "caught" if caught else "silent"
+        expected = want if want == "zero" else "nonzero"
+        print(f"  {'ok' if not any(label in p for p in problems) else 'WRONG':>5}  "
+              f"{label} -> rc={rc} ({verdict}, expected {expected})")
+    return problems
+
+
 MUST_FAIL = [
     Case(
         "per-call clock value inside an alert detail",
@@ -888,11 +1002,21 @@ CONTROL = [
 ]
 
 
-def run_check(repo: Path) -> tuple[int, str]:
+def run_check(repo: Path, check: Path = CHECK) -> tuple[int, str]:
+    """Run the determinism gate against `repo`.
+
+    `check` defaults to this repository's own script, which is right for the
+    cases that mutate product code: `python -m toxindb` resolves the package
+    from `cwd`, so the copy is what gets imported either way. It is *not* right
+    for a case that mutates the gate itself, so the tree-assertion check passes
+    the copy's script explicitly. Pointing at the original there made the
+    mutation inert and the check read as a failure of the assertion rather than
+    of the harness -- worth naming, because both look like "the gate is dead".
+    """
     scratch = Path(tempfile.mkdtemp(prefix="teeth-scratch-"))
     try:
         proc = subprocess.run(
-            [sys.executable, str(CHECK), str(scratch)],
+            [sys.executable, str(check), str(scratch)],
             cwd=repo,
             capture_output=True,
             text=True,
@@ -991,6 +1115,13 @@ def main() -> int:
     )
     problems.extend(check_normaliser_scope())
 
+    print(
+        "\nWorking-tree assertion -- proved against a real `git init` "
+        "checkout, because every case above runs without one and therefore "
+        "with this assertion legitimately skipped:"
+    )
+    problems.extend(check_tree_assertion())
+
     for path in created:
         shutil.rmtree(path, ignore_errors=True)
 
@@ -1005,8 +1136,9 @@ def main() -> int:
         f"absorbed {len(MUST_PASS)} documented normalisation end to end, verified "
         f"{len(scope_cases())} normaliser scope properties directly "
         f"({len(scope_cases()) - len(VOLATILE_LOOKING_NAMES)} distinct, plus "
-        f"{len(VOLATILE_LOOKING_NAMES)} names through one code path), and did "
-        "not confuse a crash with a detection."
+        f"{len(VOLATILE_LOOKING_NAMES)} names through one code path), caught "
+        "a write into the checkout and went silent once that comparison was "
+        "removed, and did not confuse a crash with a detection."
     )
     return 0
 
