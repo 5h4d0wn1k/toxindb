@@ -123,8 +123,12 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Requires Python 3.10+. The core has **no runtime dependencies**. `pytest` is
-the only dev dependency.
+Requires Python 3.10+. The core has **no runtime dependencies**. Contributor
+tooling (`pytest`, `pytest-cov`, `ruff`) is declared in the `dev` extra:
+
+```bash
+pip install -e ".[dev]"
+```
 
 ## Quick Start (demo)
 

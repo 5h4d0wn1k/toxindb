@@ -24,10 +24,15 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# The core stays stdlib-only by design (see SCOPE.md). Everything a
-# contributor needs is pinned to a lower bound only, and lives here rather
-# than in CI so that `pip install -e ".[dev]"` is reproducible.
-# CONTRIBUTING.md has always documented this extra; it simply did not exist.
+# The core stays stdlib-only by design (see SCOPE.md). Contributor tooling
+# lives here rather than being spelled out in the workflow, so that
+# `pip install -e ".[dev]"` gives a contributor the same tools CI uses.
+# CONTRIBUTING.md has always documented this extra; it simply did not exist,
+# so `pip install -e ".[dev]"` silently installed nothing.
+#
+# Lower bounds only, not pins: this is a library, and a hard pin would leak
+# into every consumer's resolver. Reproducibility for CI comes from the
+# workflow installing the tools it needs directly, not from here.
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
@@ -49,26 +54,30 @@ addopts = "-v --tb=short"
 
 [tool.coverage.run]
 source = ["toxindb"]
-# __main__ is a `python -m toxindb` shim and is exercised by the CLI tests via
-# the console-script entry point, so it is not worth a coverage ratchet.
-omit = ["toxindb/__main__.py"]
 
 [tool.coverage.report]
 show_missing = true
-skip_covered = false
-# Currently 97%. The gate is set below the real number so it fails on a
-# regression, not on ordinary churn, and is expected to be ratcheted upward
-# as new code lands.
-fail_under = 95
+# No `fail_under` here on purpose. This section applies to every coverage
+# invocation, including a contributor's `pytest tests/test_one_thing.py --cov`
+# while they debug a single module, and a threshold there turns ordinary work
+# into a red build. The threshold is a property of the CI gate, not of the
+# project, so it is passed as `--cov-fail-under` by the workflow instead.
+#
+# Nothing is omitted either. `toxindb/__main__.py` is a two-line `python -m
+# toxindb` shim and measures 0%, because the console-script entry point
+# (`toxindb.cli:main`) does not import it and subprocess coverage is not
+# enabled. Excluding it would have meant justifying an exclusion that is not
+# actually about reachability; leaving it in costs 0.34 points and stays
+# honest.
 
 [tool.ruff]
 target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
-# The gate starts at the correctness-critical subset only: syntax errors and
-# undefined/redefined names. That set passes today, so the gate is real rather
-# than aspirational.
+# The gate starts at the correctness-critical subset only: syntax errors,
+# undefined names, and redefined names (F811). That set passes today, so the
+# gate is real rather than aspirational.
 #
 # The wider default rule set reports 159 findings, essentially all cosmetic
 # modernisation (52 PEP 585 annotations, 30 import ordering, 28 unused
@@ -76,4 +85,4 @@ line-length = 100
 # mechanical, so they belong in a dedicated style pass rather than being
 # mixed into behavioural changes. Once that lands, widen `select` here to
 # match, and the gate will keep them fixed from then on.
-select = ["E9", "F63", "F7", "F82"]
+select = ["E9", "F63", "F7", "F811", "F82"]

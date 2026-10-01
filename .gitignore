@@ -19,3 +19,8 @@ env/
 *.log
 reports/
 !examples/
+
+# `toxindb canary <trace> --plant` writes the planted trace next to its input
+# (issue #21: it ignores --output). Following the README leaves an untracked
+# file behind, so ignore the pattern rather than the documentation.
+*_canary_planted.jsonl

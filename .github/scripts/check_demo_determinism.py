@@ -1,46 +1,47 @@
 #!/usr/bin/env python3
 """Assert that the bundled demo is deterministic.
 
-Why this exists
----------------
-The README and SCOPE.md promise deterministic offline analysis over the bundled
-fixtures. That promise is easy to break accidentally: a heuristic that starts
-iterating a set, a dict whose key order depends on insertion, or a wall-clock
-derived threshold would all make the demo's output drift between runs while
-every test still passed -- because the suite never compares two runs against each
-other. It only checks each run against fixed expectations.
+Run-to-run variation in a security tool is a defect, not a cosmetic issue: it
+means two analysts looking at the same evidence can reach different conclusions
+and neither can tell why. The demo is the artifact this repository ships as
+"here is what toxindb does", so it has to be byte-stable.
 
-Running this check is how the nondeterministic ``doc_ids`` ordering in TX-008
-(issue #22) was found in the first place.
+How this compares output
+------------------------
+Each output file is parsed and re-serialised into a canonical form, then the
+two runs' canonical forms are compared. Parsing rather than line-matching
+matters: an earlier version of this script dropped *whole lines* whose text
+contained the substring ``generated_at``, which meant that if the JSON report
+was ever rendered compactly the entire report would collapse to one line, that
+line would match, and the report would silently drop out of the comparison
+while the gate stayed green. Key-level normalisation cannot fail that way --
+dropping a key does not change the shape of the surrounding document.
 
-What is and is not normalised
------------------------------
-A determinism gate is only worth having if its blind spots are written down and
-narrow, so there are exactly three, each commented where it is defined:
+What is normalised, and why
+---------------------------
+Exactly two things, and nothing else:
 
-1. Report metadata -- ``generated_at`` and the Markdown ``**Generated:**``
-   header. These record *when* a report was written, not a detection result.
-   A report that omitted when it was produced would be worse, so this is a
-   genuine value, not a defect.
-2. The ordering of ``doc_ids`` within a single alert, which is currently
-   nondeterministic because TX-008 builds it from a set (issue #22). This is a
-   real defect, so it is normalised only to keep this gate green while the
-   defect is open. When #22 is fixed, delete ``_canonicalise_doc_ids`` and this
-   check starts enforcing ordering as well.
-3. The line layout of a ``doc_ids`` array. The JSONL alerts are written one
-   record per line while the JSON reports are pretty-printed, so the same value
-   appears as ``"doc_ids": ["a", "b"]`` in one and as a four-line block in the
-   other. Both are normalised to one canonical single-line sorted form so the
-   two runs are comparable. This erases formatting only; it cannot hide a
-   changed value.
+1. **Report metadata.** ``generated_at`` in the JSON report and the
+   ``**Generated:**`` line in the Markdown report record *when a report was
+   written*. They are not detection results, and two runs a second apart are
+   expected to differ in them.
 
-Everything else -- counts, heuristic ids, severities, confidences, alert
-ordering, the summary -- must match byte for byte.
+2. **The ordering of ``doc_ids`` in TX-008 alerts only.** TX-008 builds this
+   list from a set, so its order varies with the interpreter's hash seed. That
+   is a real defect (issue #22), normalised only while it is open. The
+   normalisation is deliberately scoped to TX-008: applying it to every
+   detector would hide any future ordering bug in any other heuristic, so
+   ``check_gate_teeth.py`` injects a random ordering into TX-001 and requires
+   this script to still catch it.
+
+Everything else -- alert counts, heuristic ids, severities, confidences, detail
+strings, alert ordering, the set of files produced -- must match exactly.
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import shutil
@@ -49,95 +50,180 @@ import sys
 import tempfile
 from pathlib import Path
 
-# (1) Report metadata, not results.
-_DROP_LINE = re.compile(r'"generated_at"|\*\*Generated:\*\*')
+# Report metadata. A key in this set is removed wherever it appears, at any
+# depth. Only add a key here if it records when the report was written, never
+# if it records something the detectors concluded.
+VOLATILE_KEYS = frozenset({"generated_at"})
 
-# (2) and (3) The known-open nondeterministic doc_ids ordering, and the
-# difference between single-line and pretty-printed JSON. DOTALL is required
-# because in the pretty-printed reports the array spans several lines; the
-# match is bounded by the first ``]`` so it cannot run away.
-_DOC_IDS_ARRAY = re.compile(r'"doc_ids"\s*:\s*\[(.*?)\]', re.DOTALL)
-_QUOTED = re.compile(r'"([^"]*)"')
+# The one heuristic whose doc_ids ordering is normalised, and why.
+NORMALISED_HEURISTIC = "TX-008"
 
-# The Markdown report renders the same list on one line, backticked.
-_MD_DOCS = re.compile(r"^(\s*-?\s*\*\*Documents:\*\*\s*)(.*)$")
 _BACKTICKED = re.compile(r"`([^`]*)`")
+# The report's metadata line. `render_markdown_report` emits it unbulleted, but
+# the optional list marker is accepted so that restyling the renderer does not
+# turn a metadata field into a reported difference. `*Generated by toxindb ...*`
+# is the italic footer, not this line, and still matches nothing.
+_MD_GENERATED = re.compile(r"^\s*(?:[-*+]\s+)?\*\*Generated:\*\*")
+_MD_SECTION = re.compile(r"^###\s+(TX-\d+)")
+_MD_DOCUMENTS = re.compile(r"^(\s*-\s*\*\*Documents:\*\*\s*)(\S.*?)\s*$")
+# A Documents tail that is *nothing but* a comma-separated list of doc ids.
+# Anything else -- extra prose, a count, a trailing note -- is left untouched,
+# because reordering part of a sentence is not something this gate should do.
+_MD_ID_LIST = re.compile(r"^`[^`]*`(?:,\s*`[^`]*`)*$")
+
+DEMO_ARGV = ("demo",)
 
 
-def _canonicalise_doc_ids(text: str) -> str:
-    """Sort every ``doc_ids`` array into one canonical single-line form."""
-
-    def repl(match: re.Match[str]) -> str:
-        ids = _QUOTED.findall(match.group(1))
-        # Preserve the original separator style so the JSONL alerts (which use
-        # ", ") and the reports (which use ",\n") both stay valid-looking.
-        return '"doc_ids": [' + ", ".join(f'"{i}"' for i in sorted(ids)) + "]"
-
-    return _DOC_IDS_ARRAY.sub(repl, text)
+# --------------------------------------------------------------------------
+# Normalisation
+# --------------------------------------------------------------------------
 
 
-def _sort_md_ids(match: re.Match[str]) -> str:
-    ids = _BACKTICKED.findall(match.group(2))
-    if not ids:
-        return match.group(0)
-    return f"{match.group(1)}" + ", ".join(f"`{i}`" for i in sorted(ids))
+def _scrub(value):
+    """Remove volatile keys and sort one heuristic's doc_ids, in place."""
+    if isinstance(value, dict):
+        for key in VOLATILE_KEYS:
+            value.pop(key, None)
+        doc_ids = value.get("doc_ids")
+        if (
+            value.get("heuristic_id") == NORMALISED_HEURISTIC
+            and isinstance(doc_ids, list)
+        ):
+            value["doc_ids"] = sorted(doc_ids, key=str)
+        for item in value.values():
+            _scrub(item)
+    elif isinstance(value, list):
+        for item in value:
+            _scrub(item)
+    return value
 
 
-def normalise(text: str) -> str:
-    kept: list[str] = []
-    for line in text.splitlines(keepends=True):
-        if _DROP_LINE.search(line):
+def _canonical_json(text: str) -> str | None:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return json.dumps(_scrub(data), sort_keys=True, ensure_ascii=False)
+
+
+def _canonical_jsonl(text: str) -> str | None:
+    lines = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            lines.append(raw)
             continue
-        stripped = line.rstrip("\n")
-        newline = line[len(stripped) :]
-        line = _sort_md_ids_regex(stripped) + newline
-        kept.append(line)
-    return _canonicalise_doc_ids("".join(kept))
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            return None
+        lines.append(json.dumps(_scrub(record), sort_keys=True, ensure_ascii=False))
+    return "\n".join(lines)
 
 
-def _sort_md_ids_regex(line: str) -> str:
-    return _MD_DOCS.sub(_sort_md_ids, line)
+def _canonical_markdown(text: str) -> str:
+    out = []
+    section = None
+    for line in text.splitlines(keepends=True):
+        heading = _MD_SECTION.match(line)
+        if heading:
+            section = heading.group(1)
+        if _MD_GENERATED.match(line):
+            continue
+        if section == NORMALISED_HEURISTIC:
+            line = _sort_markdown_documents(line)
+        out.append(line)
+    return "".join(out)
 
 
-def read_normalised(path: Path) -> str:
-    return normalise(path.read_text(encoding="utf-8", errors="replace"))
+def _sort_markdown_documents(line: str) -> str:
+    stripped = line.rstrip("\n")
+    newline = line[len(stripped):]
+    match = _MD_DOCUMENTS.match(stripped)
+    if not match:
+        return line
+    prefix, tail = match.group(1), match.group(2)
+    if not _MD_ID_LIST.match(tail):
+        # Not a pure id list. Sorting it would mean guessing where the list
+        # ends, so leave the line exactly as it is.
+        return line
+    ids = _BACKTICKED.findall(tail)
+    return f"{prefix}{', '.join(f'`{i}`' for i in sorted(ids))}{newline}"
+
+
+def normalise(path: Path, text: str) -> str:
+    if path.suffix == ".jsonl":
+        canonical = _canonical_jsonl(text)
+    elif path.suffix == ".json":
+        canonical = _canonical_json(text)
+    else:
+        canonical = _canonical_markdown(text)
+    if canonical is None:
+        # Not machine-readable after all. Compare the raw bytes: an
+        # unparseable file differing between runs is still a difference.
+        return text
+    return canonical
+
+
+# --------------------------------------------------------------------------
+# Driver
+# --------------------------------------------------------------------------
 
 
 def run_demo(dest: Path) -> None:
     if dest.exists():
         shutil.rmtree(dest)
-    # Invoke the package through the *current* interpreter rather than whatever
-    # `toxindb` happens to be first on PATH. Using the console script would
-    # silently test a different install than the one under test.
     completed = subprocess.run(
-        [sys.executable, "-m", "toxindb", "demo", "--output", str(dest)],
+        [sys.executable, "-m", "toxindb", *DEMO_ARGV, "--output", str(dest)],
         capture_output=True,
         text=True,
     )
     if completed.returncode != 0:
-        sys.stderr.write(completed.stdout + completed.stderr)
-        raise SystemExit(f"error: `toxindb demo --output {dest}` failed (rc={completed.returncode})")
+        sys.stderr.write(completed.stdout)
+        sys.stderr.write(completed.stderr)
+        raise SystemExit(
+            f"the demo failed to run (rc={completed.returncode}); "
+            "this is not a determinism result"
+        )
+    # The output directory is created here rather than relied upon from the
+    # demo, so that a demo which writes no files produces an empty directory
+    # instead of a missing one. Both mean "no output", but only one of them
+    # reaches the comparison that reports it.
+    dest.mkdir(parents=True, exist_ok=True)
+
+
+def _files(root: Path) -> set[Path]:
+    return {p.relative_to(root) for p in root.rglob("*") if p.is_file()}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("scratch", nargs="?", help="scratch directory (default: a temp dir)")
+    parser.add_argument(
+        "scratch",
+        nargs="?",
+        help="directory to work in (default: a fresh temporary directory)",
+    )
     args = parser.parse_args()
 
-    scratch = Path(args.scratch) if args.scratch else Path(tempfile.mkdtemp(prefix="toxindb-det-"))
+    scratch = Path(args.scratch) if args.scratch else Path(
+        tempfile.mkdtemp(prefix="toxindb-determinism-")
+    )
     scratch.mkdir(parents=True, exist_ok=True)
-    out = scratch / "out"
-    snapshot = scratch / "snapshot"
 
-    print("Running the demo twice and comparing the results...")
-    run_demo(out)
-    if snapshot.exists():
-        shutil.rmtree(snapshot)
-    shutil.copytree(out, snapshot)
-    run_demo(out)
+    # Both runs write to the *same* directory, and the first run's output is
+    # copied aside before the second overwrites it. That is deliberate: reports
+    # embed the output path they were written to (demo_summary.json lists the
+    # report filenames), so running the two runs into two different
+    # directories would compare those paths rather than the results.
+    live = scratch / "live"
+    first, second = scratch / "run1", scratch / "run2"
 
-    first_files = {p.relative_to(snapshot) for p in snapshot.rglob("*") if p.is_file()}
-    second_files = {p.relative_to(out) for p in out.rglob("*") if p.is_file()}
+    run_demo(live)
+    shutil.copytree(live, first)
+    run_demo(live)
+    shutil.copytree(live, second)
+
+    first_files = _files(first)
+    second_files = _files(second)
 
     failures = 0
     for rel in sorted(first_files - second_files):
@@ -147,28 +233,48 @@ def main() -> int:
         print(f"::error::{rel} was produced by run 2 but not by run 1")
         failures += 1
 
-    for rel in sorted(first_files & second_files):
-        a = read_normalised(snapshot / rel)
-        b = read_normalised(out / rel)
-        if a != b:
-            print(f"::error::{rel} differs between runs (ignoring timestamps, #22 doc_ids order, array layout)")
-            import difflib
+    common = first_files & second_files
+    if not common:
+        # Comparing nothing proves nothing. Reporting this as determinism would
+        # be the single worst thing this script could do.
+        print(
+            "::error::the demo produced no output files in common, so determinism "
+            "cannot be claimed"
+        )
+        return 1
 
-            for line in list(
-                difflib.unified_diff(
-                    a.splitlines(), b.splitlines(), fromfile=f"run1/{rel}", tofile=f"run2/{rel}", lineterm=""
-                )
-            )[:40]:
-                print(f"  {line}")
-            failures += 1
+    for rel in sorted(common):
+        a = normalise(rel, (first / rel).read_text(encoding="utf-8", errors="replace"))
+        b = normalise(rel, (second / rel).read_text(encoding="utf-8", errors="replace"))
+        if a == b:
+            continue
+        print(f"::error::{rel} differs between runs")
+        diff = list(
+            difflib.unified_diff(
+                a.splitlines(),
+                b.splitlines(),
+                fromfile=f"run1/{rel}",
+                tofile=f"run2/{rel}",
+                lineterm="",
+            )
+        )
+        for entry in diff[:40]:
+            print(f"  {entry}")
+        if len(diff) > 40:
+            print(f"  ... and {len(diff) - 40} more diff line(s)")
+        failures += 1
 
     if failures:
-        print(f"::error::the demo is NOT deterministic ({failures} difference(s))")
+        print(
+            f"::error::the demo is NOT deterministic "
+            f"({failures} difference(s) across {len(common)} compared file(s))"
+        )
         return 1
 
     print(
-        f"Compared {len(first_files & second_files)} file(s) across two runs: the demo is "
-        "deterministic (ignoring report timestamps, #22 doc_ids order, and array layout)."
+        f"Compared {len(common)} file(s) across two runs: the demo is "
+        f"deterministic (ignoring report timestamps and {NORMALISED_HEURISTIC} "
+        f"doc_ids order, per the module docstring)."
     )
     return 0
 
