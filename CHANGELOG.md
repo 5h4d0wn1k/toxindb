@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`clean_trace.jsonl`, `poison_trace.jsonl`, `canary_trace.jsonl`).
 - Canary lifecycle — plant and monitor retrieval-time canary claims, with
   deterministic seeding.
-- Provenance attestation audit, including fully-unsigned source detection.
+- Provenance attestation audit: signature coverage per source, owner/source
+  consistency, multi-owner sources, and shared-signature clustering. Note that
+  unsigned docs are only flagged when the same source *also* has signed
+  documents — a wholly unsigned source is currently missed (#8).
 - Report renderer producing Markdown and JSON, plus a JSONL alert stream.
 - `toxindb` CLI: `monitor`, `canary`, `provenance`, `report`, `demo`.
 - 139-test suite covering every heuristic (each with both a poison-trace test
@@ -48,6 +51,11 @@ These are tracked as open issues and are **not** fixed in the current tree.
 See the [v1.0 hardening milestone](https://github.com/5h4d0wn1k/toxindb/milestone/1) for
 current status.
 
+- **A wholly unsigned source is invisible to both the provenance audit and
+  TX-010.** `provenance.py` only reports an unsigned doc when that source also
+  has a signed peer, so a source with no signatures at all is never flagged.
+  This is the primary supply-chain signal, and a unit test currently asserts
+  the silence (#8).
 - `SECURITY.md` directs vulnerability reports to a GitHub `users.noreply`
   address, which cannot receive mail (#15).
 - `CONTRIBUTING.md` instructs `pip install -e ".[dev]"`, but `pyproject.toml`

@@ -16,7 +16,12 @@ issues if they share a root cause. If this PR only partially addresses an issue,
 link it with "Refs #NN" and say what is left.
 -->
 
-Closes #
+Closes #NN
+
+<!--
+A pull request that fixes nothing linked should say "None" rather than leaving
+the placeholder, so it is obvious the omission was deliberate.
+-->
 
 ## Type of change
 
@@ -32,7 +37,6 @@ Closes #
 - [ ] Added or updated tests
 - [ ] `pytest tests/ -v` passes with 0 failures
 - [ ] New heuristic has **both** a poison-trace test (fires) and a clean-trace test (quiet)
-- [ ] Covered branches are at or above the CI coverage gate
 
 <!--
 Paste the actual result, e.g.:

@@ -1,8 +1,16 @@
 # Code owners for toxindb.
 #
-# toxindb is a small, security-sensitive detector: a change that makes a
-# heuristic stop firing is a change that breaks its entire reason for existing.
-# These rules make that somebody's explicit job.
+# Honest caveat: this project has exactly one maintainer, so every rule below
+# resolves to the same person and this file currently routes nothing. Its
+# purpose is to *document* which paths are safety-critical, so that adding a
+# second maintainer later is a matter of naming them here rather than
+# rediscovering the blast radius. Treat it as intent, not as enforcement: the
+# rules only gate anything once `main` has branch protection, which it does not
+# yet have.
+#
+# The paths that matter most are the detection and trace-schema files. A change
+# that makes a heuristic stop firing, or that changes how a trace is parsed,
+# breaks the project's premise and would not be caught by any other signal.
 
 # Default owner for everything not matched below.
 *                               @5h4d0wn1k
