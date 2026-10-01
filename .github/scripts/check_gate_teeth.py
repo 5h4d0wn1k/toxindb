@@ -866,8 +866,18 @@ class Case:
 #
 # The end-to-end cases above copy the tree *without* `.git`, because a copy of
 # the checkout is what lets a mutation perturb the run rather than the
-# repository. That also means every one of those cases runs the gate with the
-# tree assertion legitimately skipped, so none of them can show whether it works.
+# repository. That means none of them can show whether the tree assertion works.
+#
+# An earlier version of this comment said the assertion was "legitimately
+# skipped" for those cases, which was false and flattered the check that
+# follows. It was not skipped -- it was *aimed at the wrong tree*. The cases
+# call `run_check(repo)`, which runs this repository's own gate script, and the
+# gate resolves its root from `__file__`, so the comparison snapshotted the
+# original checkout while every write landed in the copy. Verified: no skip note
+# is printed, and the tree error never appears, on a run whose copy is a real
+# checkout containing an injected write. The assertion was live and blind.
+#
+# That is why the checks below pass the *copy's* script explicitly.
 #
 # It matters because the demo resolves its fixtures through the *package*
 # directory, so a change that writes into the checkout is the exact failure the
@@ -1305,8 +1315,9 @@ def main() -> int:
 
     print(
         "\nWorking-tree assertion -- proved against a real `git init` "
-        "checkout, because every case above runs without one and therefore "
-        "with this assertion legitimately skipped:"
+        "checkout in the copy, because every case above runs without one, and "
+        "the default `run_check` would point the assertion at the original "
+        "tree rather than skip it:"
     )
     problems.extend(check_tree_assertion())
 

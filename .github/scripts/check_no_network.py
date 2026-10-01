@@ -122,6 +122,17 @@ NETWORK_MODULES = frozenset(
 # project would plausibly reach for are in it, and that nothing is added
 # wrongly -- `SELF_TEST_CASES` covers the second direction, since every one of
 # those must still be accepted. Stated as a floor, not a ceiling.
+#
+# Two limits, stated rather than papered over. This tuple and `NETWORK_MODULES`
+# are literals in the same file, so deleting a name from both is invisible to
+# every check here -- a reviewer demonstrated it for `http` and `requests`,
+# whose only protection was this floor. Both now have a synthetic case as well,
+# so dropping either from both lists turns the self-test red; that is the fix,
+# and it is what makes the coordinated edit detectable for all 22 current names.
+# What is still true, and is the real limit: a *new* client library added to
+# neither list cannot be caught by anything here. Only a human deciding what this
+# project would plausibly reach for supplies that, which is why the tuple above
+# is written as a list of names rather than derived from `NETWORK_MODULES`.
 REQUIRED_NETWORK_MODULES = (
     "aiohttp",
     "boto3",
@@ -254,10 +265,13 @@ SELF_TEST_CASES: tuple[tuple[str, str, bool], ...] = (
 def missing_required_modules() -> list[str]:
     """Well-known network clients absent from `NETWORK_MODULES`.
 
-    This is the one direction a tree of synthetic files cannot check, because
-    every file it builds is written by this file -- widening the list wrongly is
-    caught, but narrowing it is invisible unless the reader already knows which
-    names matter. The names below are checked against the list directly instead.
+    Second line of defence, and the weaker one: both this tuple and
+    `NETWORK_MODULES` are literals in this file, so it cannot catch a name
+    deleted from both, and it is not the check that catches a name deleted from
+    `NETWORK_MODULES` alone -- the synthetic case importing that name does,
+    which is why every entry in the list has one. Kept because it fails for a
+    different reason and so covers the case where the synthetic cases are
+    themselves edited.
     """
     return [name for name in REQUIRED_NETWORK_MODULES if name not in NETWORK_MODULES]
 

@@ -658,7 +658,7 @@ def extract_shell_blocks(
             ):
                 ignoring = ""
                 continue
-            if fence_match:
+            if fence_match and len(fence_match.group("ticks")) >= len(ignoring):
                 # A fence carrying an info string cannot close the fence we are
                 # skipping, so that fence is still open. This is the silent
                 # version of the defect the check below reports: a forgotten
@@ -676,6 +676,19 @@ def extract_shell_blocks(
                 # let the open fence run to the end of the document: this gate
                 # over-scans in preference to missing a command, and it has
                 # already said the structure is broken.
+                #
+                # Only a fence *at least as long* as the opener can trigger this.
+                # A shorter one is ordinary content, in CommonMark and here: the
+                # closing rule is the same length rule used for `bash` blocks
+                # below, and applying it to only one of the two branches is how
+                # this went wrong. A 3-backtick fence inside a 4-backtick
+                # ````markdown block is the ordinary way to document a fenced
+                # block, and this branch used to report the outer fence
+                # unterminated and then open the *content* as a new block --
+                # swallowing the ```bash after it and failing a document that
+                # every CommonMark renderer accepts. Checked against
+                # `commonmark.commonmark`, which renders exactly that input as
+                # two blocks with the second one real.
                 _report_unterminated(
                     ignoring_start,
                     f"non-shell code fence opened here is never closed",
@@ -683,6 +696,8 @@ def extract_shell_blocks(
                 )
                 ignoring = ""
             else:
+                # Either not a fence at all, or one too short to close or to
+                # open anything. Content, and skipped like any other.
                 continue
         if not in_block:
             if not fence_match:

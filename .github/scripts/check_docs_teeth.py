@@ -436,6 +436,37 @@ STRUCTURAL = [
         0,
         expect=f"PASS  README.md:4     toxindb --version",
     ),
+    # The same length rule on the *other* branch. The fence-length fix above
+    # covered only the `bash` branch, so the `ignoring` branch -- the one that
+    # skips non-shell fences -- kept accepting any shorter fence as a closer and
+    # separately treated one as a new opener. A 3-backtick fence inside a
+    # 4-backtick ````markdown block is the ordinary way to document a fenced
+    # block, and the gate reported the outer fence unterminated and then opened
+    # the content as a new block, swallowing the ```bash after it. The
+    # document renders as two blocks in every CommonMark implementation.
+    #
+    #     1 # Synthetic   2 (blank)   3 ````markdown   4 ```   5 x   6 ```
+    #     7 ````         8 (blank)   9 ```bash        10 the command   11 ```
+    # `nosuchsubcommand` is the load-bearing part: it is only ever reached if the
+    # ```bash block survives, so this case fails if the block is swallowed again.
+    Case(
+        "a short fence inside a longer markdown fence is content, not a block",
+        "# Synthetic\n\n````markdown\n```\nx\n```\n````\n\n"
+        "```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect="FAIL  README.md:10    toxindb nosuchsubcommand",
+    ),
+    # ...and the control for that one: with the shorter fence treated as an
+    # opener rather than content, the *inner* block closes at line 4 and the
+    # ```bash block is never reached at all, so no `FAIL` is printed for a
+    # command that is right there in the document.
+    Case(
+        "and the block after such a fence is still reached",
+        "# Synthetic\n\n````markdown\n```\nx\n```\n````\n\n"
+        "```bash\ntoxindb --version\n```\n",
+        0,
+        expect="PASS  README.md:10    toxindb --version",
+    ),
 ]
 
 # --------------------------------------------------------------------------
