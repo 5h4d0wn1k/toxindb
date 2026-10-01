@@ -267,6 +267,15 @@ def _tree_state(root: Path) -> str | None:
 
     Returns None outside a git checkout, where the assertion is skipped with a
     printed note rather than assumed to have passed.
+
+    Byte-code caches are filtered out. They are created by *importing* the
+    package, so they appear during any run that imports toxindb and say nothing
+    about whether the run wrote to the tree. They are also the one ignored path
+    guaranteed to be new on a fresh CI checkout, which is exactly what happened:
+    the first version of this assertion failed on `!! toxindb/__pycache__/` and
+    nothing else. The filter is deliberately narrow -- only `__pycache__`
+    directories and `.pyc` files -- because everything else, including ignored
+    data files, is a real signal.
     """
     proc = subprocess.run(
         [
@@ -280,7 +289,13 @@ def _tree_state(root: Path) -> str | None:
         capture_output=True,
         text=True,
     )
-    return None if proc.returncode != 0 else proc.stdout
+    if proc.returncode != 0:
+        return None
+    return "".join(
+        line
+        for line in proc.stdout.splitlines(keepends=True)
+        if "__pycache__" not in line and not line.rstrip().endswith(".pyc")
+    )
 
 
 def _assert_tree_unchanged(before: str | None, after: str | None, root: Path) -> int:

@@ -256,7 +256,17 @@ def _tree_state(root: Path) -> str | None:
     )
     if proc.returncode != 0:
         return None
-    return proc.stdout
+    # Byte-code caches are excluded. They come from importing the package, not
+    # from a documented command, and on a fresh CI checkout they are always new
+    # -- which is what made the first version of this assertion fail on
+    # `!! toxindb/__pycache__/` and nothing else. Narrow by design: only
+    # `__pycache__` directories and `.pyc` files, so an ignored *data* file such
+    # as a planted canary is still a signal.
+    return "".join(
+        line
+        for line in proc.stdout.splitlines(keepends=True)
+        if "__pycache__" not in line and not line.rstrip().endswith(".pyc")
+    )
 
 
 _FENCE = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*(?P<info>.*?)\s*$")
