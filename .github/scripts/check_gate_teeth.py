@@ -883,13 +883,24 @@ class Case:
 # pair pins the red to the assertion.
 
 _TREE_WRITE_ANCHOR = "    output_dir = args.output\n    os.makedirs(output_dir, exist_ok=True)\n"
-_TREE_WRITE = "    open('TEETH_TREE_WRITE.json', 'w').write('x')\n"
 _TREE_ASSERTION = "    if before == after:\n        return 0\n"
 
 
-def _inject_tree_write(repo: Path) -> None:
+def _inject_write_of(repo: Path, relative: str) -> None:
+    """Make the demo write `relative` (a cwd-relative path) while it runs.
+
+    The write has to happen *during* the run, not before it. A file that already
+    exists when the gate takes its first snapshot is in both snapshots, so the
+    comparison cannot see it -- which is why the byte-code cases below mutate
+    the product code to create their artefacts instead of creating them here.
+    """
     cli = repo / "toxindb" / "cli.py"
-    _replace(cli, _TREE_WRITE_ANCHOR, _TREE_WRITE_ANCHOR + _TREE_WRITE)
+    write = f"    open({relative!r}, 'w').write('x')\n"
+    _replace(cli, _TREE_WRITE_ANCHOR, _TREE_WRITE_ANCHOR + write)
+
+
+def _inject_tree_write(repo: Path) -> None:
+    _inject_write_of(repo, "TEETH_TREE_WRITE.json")
 
 
 def _neutralise_tree_assertion(repo: Path) -> None:
@@ -914,6 +925,183 @@ def _git_init(repo: Path) -> list[str]:
     if proc.returncode != 0:
         raise MutationFailed(f"`git init` failed: {proc.stderr.strip()}")
     return []
+
+
+_FILTER_ANCHOR = (
+    '    return "__pycache__" in path.split("/") or path.endswith(".pyc")\n'
+)
+
+
+def m_filter_off(repo: Path) -> None:
+    """The byte-code filter stops recognising anything at all."""
+    _replace(
+        repo / ".github" / "scripts" / "check_demo_determinism.py",
+        _FILTER_ANCHOR,
+        "    return False\n",
+    )
+
+
+def m_filter_substring(repo: Path) -> None:
+    """The filter matches `__pycache__` anywhere in the path, not per component."""
+    _replace(
+        repo / ".github" / "scripts" / "check_demo_determinism.py",
+        _FILTER_ANCHOR,
+        '    return "__pycache__" in path or path.endswith(".pyc")\n',
+    )
+
+
+# `_is_byte_code_cache` sees a whole `git status --porcelain` line, not a path.
+# `??` is the common prefix; a rename reads `R  old -> new`.
+_BYTE_CODE_PROPERTIES = (
+    ("?? toxindb/__pycache__/cli.cpython-314.pyc\n", True),
+    ("?? __pycache__/cli.pyc\n", True),
+    ("?? probe.pyc\n", True),
+    ('?? "toxindb/__pycache__/a b.pyc"\n', True),
+    ("?? toxindb/report_cache.py\n", False),
+    ("?? toxindb/pyc_tool.py\n", False),
+    ("?? docs/cache-notes.md\n", False),
+    ("?? src/pycache/README.md\n", False),
+    ("?? reports/out.json\n", False),
+    # Not a path component, only a substring of the file name. Deliberately
+    # close to contrived: it exists to separate component matching from
+    # substring matching, and the two disagree nowhere else.
+    ("?? toxindb/__pycache__helper.py\n", False),
+    ("?? toxindb/map__pycache__v2.json\n", False),
+    # A rename is reported as `old -> new`, and the name on disk is the new one.
+    ("R  toxindb/old.py -> toxindb/__pycache__/new.py\n", True),
+    ("R  toxindb/__pycache__/old.py -> toxindb/new.py\n", False),
+    # Short and empty lines must not raise.
+    ("", False),
+    ("??", False),
+)
+
+
+def check_byte_code_filter() -> list[str]:
+    """Prove the byte-code filter, in both directions.
+
+    The filter exists so that a run which imports the package from the checkout
+    -- which `run_check` does, since `python -m toxindb` resolves from `cwd` --
+    does not report its own `__pycache__` as a write into the tree. It had no
+    test at all: `check_tree_assertion` writes at the repo root, so nothing in
+    this suite ever produced a path for the filter to look at, and two plausible
+    regressions passed.
+
+    Both directions matter and only one of them shows up as a red gate:
+
+    * too narrow, and every run of the gate goes red for a non-reason;
+    * too wide, and a genuine write is swallowed -- the tree assertion stops
+      asserting while still printing that it ran.
+
+    So each direction is checked twice. A property table pins the classifier,
+    and an end-to-end pair proves the classifier is load-bearing on the exit
+    code, which is the thing the property table cannot see.
+    """
+    problems: list[str] = []
+
+    # --- the classifier, called directly ---------------------------------
+    spec = importlib.util.spec_from_file_location(
+        "teeth_determinism_gate", REPO / ".github" / "scripts" / "check_demo_determinism.py"
+    )
+    if spec is None or spec.loader is None:
+        return ["could not load check_demo_determinism.py to test its byte-code filter"]
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - an unloadable gate is a failure
+        return [f"could not import check_demo_determinism.py: {exc}"]
+
+    for line, expected in _BYTE_CODE_PROPERTIES:
+        try:
+            actual = module._is_byte_code_cache(line)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"_is_byte_code_cache({line!r}) raised {exc}")
+            continue
+        if actual != expected:
+            problems.append(
+                f"_is_byte_code_cache({line!r}) returned {actual}, expected "
+                f"{expected} ({'must be filtered out' if expected else 'must NOT be filtered out'})"
+            )
+        label = "cache" if expected else "not cache"
+        print(f"  {'ok' if actual == expected else 'WRONG':>5}  "
+              f"{line.strip() or '(empty)'} -> {label}")
+
+    # --- the classifier, load-bearing on the exit code -------------------
+    print("    ...and through the gate's own exit code, both directions:")
+
+    for label, artefact, mutation, want in (
+        (
+            "a byte-code cache is created and not reported as a tree write",
+            None,
+            None,
+            "zero",
+        ),
+        (
+            "and is reported once the filter stops matching",
+            None,
+            m_filter_off,
+            "nonzero",
+        ),
+        (
+            "a file whose name merely contains the prefix is reported",
+            "toxindb/__pycache__helper.py",
+            None,
+            "nonzero",
+        ),
+        (
+            "and is swallowed once the filter matches on substrings",
+            "toxindb/__pycache__helper.py",
+            m_filter_substring,
+            "zero",
+        ),
+    ):
+        repo = _fresh_repo()
+        try:
+            _git_init(repo)
+            if artefact is not None:
+                # Written by the demo *during* the run, so the second snapshot
+                # can see it at all.
+                _inject_write_of(repo, artefact)
+            if mutation is not None:
+                mutation(repo)
+            rc, output = run_check(
+                repo, check=repo / ".github" / "scripts" / "check_demo_determinism.py"
+            )
+            caches = sorted(repo.rglob("*.pyc"))
+        except MutationFailed as exc:
+            problems.append(f"{label}: {exc}")
+            continue
+        finally:
+            shutil.rmtree(repo.parent, ignore_errors=True)
+
+        # The first two cases are only meaningful if the run actually produced
+        # byte-code for the filter to swallow. `run_check` runs
+        # `python -m toxindb` with `cwd` at the checkout, so the import writes
+        # `toxindb/__pycache__/` every time -- verified at ten files, not
+        # assumed, because an empty set here would make the case vacuous.
+        if artefact is None and not caches:
+            problems.append(
+                f"{label}: the run produced no byte-code in the checkout, so "
+                f"the filter had nothing to do and this case proves nothing"
+            )
+
+        caught = rc != 0
+        ok = caught if want == "nonzero" else not caught
+        if not ok:
+            problems.append(
+                f"{label}: the gate exited {rc} "
+                f"(expected {'nonzero' if want == 'nonzero' else '0'}), so the "
+                f"byte-code filter is too "
+                f"{'wide' if mutation is m_filter_substring or mutation is None else 'narrow'}"
+            )
+        elif want == "nonzero" and "modified the working tree" not in output:
+            problems.append(
+                f"{label}: the gate exited {rc} but did not say the tree "
+                f"changed, so something else caught it"
+            )
+        print(f"  {'ok' if ok else 'WRONG':>5}  {label} -> rc={rc}"
+              f"{f' ({len(caches)} byte-code files in the checkout)' if caches else ''}")
+
+    return problems
 
 
 def check_tree_assertion() -> list[str]:
@@ -1122,6 +1310,14 @@ def main() -> int:
     )
     problems.extend(check_tree_assertion())
 
+    print(
+        "\nByte-code filter -- every case above imports the package from the "
+        "checkout, so this filter is load-bearing on all of them and had no "
+        f"test of its own. {len(_BYTE_CODE_PROPERTIES)} properties called "
+        "directly, then 4 end-to-end runs:"
+    )
+    problems.extend(check_byte_code_filter())
+
     for path in created:
         shutil.rmtree(path, ignore_errors=True)
 
@@ -1138,7 +1334,9 @@ def main() -> int:
         f"({len(scope_cases()) - len(VOLATILE_LOOKING_NAMES)} distinct, plus "
         f"{len(VOLATILE_LOOKING_NAMES)} names through one code path), caught "
         "a write into the checkout and went silent once that comparison was "
-        "removed, and did not confuse a crash with a detection."
+        f"removed, filtered byte-code caches in {len(_BYTE_CODE_PROPERTIES)} "
+        "cases and proved that filter load-bearing on the exit code in both "
+        "directions, and did not confuse a crash with a detection."
     )
     return 0
 

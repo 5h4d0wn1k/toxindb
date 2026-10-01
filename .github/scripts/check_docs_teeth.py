@@ -56,6 +56,7 @@ assertion watches, and a case that dirtied it would be caught.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -473,12 +474,20 @@ MUST_PASS = [
 # before returning -- see NO_SIDE_EFFECT above.
 
 
-def run_gate(markdown: str, workdir: Path) -> tuple[int, str]:
-    """Run the gate under test against `markdown`, with `workdir` as its CWD."""
+def run_gate(
+    markdown: str, workdir: Path, check: Path = CHECK
+) -> tuple[int, str]:
+    """Run the gate under test against `markdown`, with `workdir` as its CWD.
+
+    `check` defaults to this repository's own gate. The one case that needs
+    otherwise passes a *copy's* script on purpose: the gate resolves its
+    repository root from `__file__`, so the copy's script is the only way to
+    make it watch a scratch checkout instead of the real one.
+    """
     readme_path = workdir / "README.md"
     readme_path.write_text(markdown, encoding="utf-8")
     proc = subprocess.run(
-        [sys.executable, str(CHECK), "--readme", str(readme_path)],
+        [sys.executable, str(check), "--readme", str(readme_path)],
         cwd=workdir,
         capture_output=True,
         text=True,
@@ -494,7 +503,7 @@ def run_gate(markdown: str, workdir: Path) -> tuple[int, str]:
 # `_tree_state` is the only evidence that running the documented commands did
 # not rewrite the repository's own fixtures, and nothing above exercises it:
 # `run_case` hands the gate a scratch directory with no `.git`, so the
-# assertion is legitimately skipped in all 29 cases. Neutralising the function
+# assertion is legitimately skipped in every case above. Neutralising the function
 # entirely left this script green, which is how a docstring came to claim a
 # verification nobody had run.
 #
@@ -527,6 +536,22 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         raise MutationFailed(f"`git` is not on PATH ({exc}); this check cannot run") from exc
 
 
+def _git_ok(args: list[str], cwd: Path) -> None:
+    """`git`, but a failure to set up is a `MutationFailed` rather than a verdict.
+
+    `_git` returns its result for the cases that *want* to inspect one. Setup
+    here has no such case: if `git init` or `commit` fails, every later
+    assertion is measuring a checkout that was never built, and the check would
+    report a gate defect for a failure of its own making.
+    """
+    proc = _git(args, cwd)
+    if proc.returncode != 0:
+        raise MutationFailed(
+            f"`{' '.join(args)}` failed in {cwd.name}: "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
+
+
 def check_tree_state() -> list[str]:
     """Prove `_tree_state` reports a change, and stays quiet about a non-checkout.
 
@@ -550,16 +575,43 @@ def check_tree_state() -> list[str]:
         (checkout / "TREE_PROBE.txt").write_text("x", encoding="utf-8")
         after_new_file = gate._tree_state(checkout)
         same = gate._tree_state(checkout)
-        (checkout / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
-        (checkout / "ignored.txt").write_text("secret", encoding="utf-8")
+
+        # `.gitignore` is written *before* the baseline, and so is the ignored
+        # directory's first file. The previous version of this block created
+        # both after the baseline, so `?? .gitignore` arrived as an extra line
+        # and satisfied `after_ignored != same` under every flag setting --
+        # including `--ignored=none` and a deleted `--ignored` flag, which is
+        # exactly the configuration this property exists to forbid. An assertion
+        # that an unrelated file can satisfy is not an assertion.
+        (checkout / ".gitignore").write_text("reports/\n", encoding="utf-8")
+        (checkout / "reports").mkdir()
+        (checkout / "reports" / "first.json").write_text("{}", encoding="utf-8")
+        ignored_before = gate._tree_state(checkout)
+        # A *second* file into an already-ignored directory, which is the case
+        # `--ignored=matching` hides: it collapses the directory to one
+        # `!! reports/` line and never re-expands, so the snapshot comes back
+        # byte-identical. `--ignored=none` hides it too.
+        (checkout / "reports" / "LEAKED_SECRET.json").write_text(
+            "{}", encoding="utf-8"
+        )
         after_ignored = gate._tree_state(checkout)
 
         results.append(("a new untracked file changes the snapshot",
                         before != after_new_file, "expected a difference"))
         results.append(("an unchanged tree yields an identical snapshot",
                         after_new_file == same, "expected no difference"))
-        results.append(("a file inside an ignored directory is still listed",
-                        after_ignored != same, "expected a difference"))
+        results.append((
+            "a new file in an ignored directory changes the snapshot",
+            after_ignored != ignored_before,
+            "expected a difference: `--ignored=matching` and no flag at all "
+            "both report an ignored directory as one collapsed line",
+        ))
+        results.append((
+            "and the file is named in the snapshot, not just its directory",
+            after_ignored is not None
+            and "LEAKED_SECRET.json" in after_ignored,
+            "expected the path to appear in `git status --ignored=traditional`",
+        ))
 
         # Not a checkout: skipped with a note, never silently assumed to have
         # passed. `_tree_state` returns None for this and for nothing else.
@@ -593,6 +645,141 @@ def check_tree_state() -> list[str]:
         if not ok:
             problems.append(f"{label}: {why}")
         print(f"  {'ok' if ok else 'WRONG':>5}  {label}")
+    return problems
+
+
+# --------------------------------------------------------------------------
+# The working-tree verdict
+# --------------------------------------------------------------------------
+#
+# `check_tree_state` above proves that `_tree_state` notices a change. It says
+# nothing about whether a noticed change becomes a non-zero *exit*, because the
+# verdict lives in `main()`, two frames away and one `elif` further on.
+#
+# That gap was live. Changing `return 1` to `return 0` in the tree-assertion
+# branch -- one character -- left this entire suite green, while its summary
+# still reported that it "saw a real tree change". The suite was describing the
+# snapshot function, not the assertion the reader is being asked to trust.
+#
+# So this check drives the gate end to end, twice, and the second run removes
+# the thing the first run proved. A non-zero exit on its own would not be
+# enough: the mutation could simply break the gate in some unrelated way, so
+# the first run also insists the exit came with the tree message, and the
+# second run insists the gate goes quiet once the assertion is disarmed.
+
+_TREE_VERDICT_RETURN = (
+    '        for line in _diff_lines(tree_before, tree_after):\n'
+    '            print(f"  {line}", file=sys.stderr)\n'
+    '        return 1\n'
+    '    elif dirty:'
+)
+
+_TREE_VERDICT_MESSAGE = "running the documented commands modified the working tree"
+
+
+def _copy_repo_without_history(destination: Path) -> None:
+    """Copy the repository to `destination`, minus `.git`.
+
+    `.git` is dropped rather than copied because the copy has to be a checkout
+    the check creates itself: `git init` over a copied history would let the
+    real repository's index, and its `.gitignore`, decide what the copy sees.
+    """
+    shutil.copytree(
+        HERE.parent.parent,
+        destination,
+        ignore=shutil.ignore_patterns(".git"),
+        symlinks=True,
+    )
+
+
+def check_tree_verdict() -> list[str]:
+    """Prove a dirty working tree fails the gate, and that failing is load-bearing."""
+    problems: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="docs-verdict-") as tmp:
+        outside = Path(tmp)
+
+        for label, disarm, want_rc, want_message in (
+            ("a documented command that writes into the checkout fails the gate",
+             False, 1, True),
+            # The annotation survives; only the exit code changes. That is
+            # precisely the shape of the defect: GitHub renders a red
+            # `::error::` on a job that passed, so the evidence is on the page
+            # and the enforcement is not. So this case asserts the exit code and
+            # says nothing about the message, because a disarmed assertion still
+            # prints one.
+            ("and exits 0 once the tree assertion returns 0 instead",
+             True, 0, None),
+        ):
+            root = outside / ("disarmed" if disarm else "armed")
+            checkout = root / "checkout"
+            workdir = root / "workdir"
+            workdir.mkdir(parents=True)
+            try:
+                _copy_repo_without_history(checkout)
+                _git_ok(["git", "init", "-q"], checkout)
+                # A commit, so the baseline is a tracked tree rather than a
+                # directory of untracked files. Without it every file in the
+                # copy is `??` and the diff after the run is unreadable.
+                _git_ok(["git", "add", "-A"], checkout)
+                _git_ok(
+                    ["git", "-c", "user.email=t@example.invalid",
+                     "-c", "user.name=teeth", "commit", "-qm", "baseline"],
+                    checkout,
+                )
+                if disarm:
+                    gate_path = checkout / ".github" / "scripts" / "check_docs_commands.py"
+                    text = gate_path.read_text(encoding="utf-8")
+                    if text.count(_TREE_VERDICT_RETURN) != 1:
+                        problems.append(
+                            f"{label}: the tree-assertion branch does not appear "
+                            f"exactly once in the gate under test, so this case "
+                            f"cannot disarm it: {_TREE_VERDICT_RETURN!r}"
+                        )
+                        continue
+                    gate_path.write_text(
+                        text.replace(
+                            _TREE_VERDICT_RETURN,
+                            _TREE_VERDICT_RETURN.replace("        return 1", "        return 0"),
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                # The command writes to an absolute path inside the copy. The
+                # gate runs documented commands in a TemporaryDirectory of its
+                # own, so a relative `--output` would land outside the checkout
+                # and the tree would stay clean -- the case would pass for the
+                # wrong reason, in the direction that matters least.
+                markdown = readme(f"toxindb demo --output {checkout / 'reports'}")
+                rc, output = run_gate(
+                    markdown, workdir,
+                    check=checkout / ".github" / "scripts" / "check_docs_commands.py",
+                )
+            except (MutationFailed, OSError) as exc:
+                problems.append(f"{label}: {exc}")
+                continue
+
+            if rc != want_rc:
+                problems.append(
+                    f"{label}: expected exit {want_rc}, got {rc}. Output: "
+                    f"{output.strip()[-500:]}"
+                )
+            has_message = _TREE_VERDICT_MESSAGE in output
+            if want_message is not None and has_message != want_message:
+                problems.append(
+                    f"{label}: expected "
+                    f"{'the tree message' if want_message else 'no tree message'}, "
+                    f"got {'it' if has_message else 'none'}. Output: "
+                    f"{output.strip()[-500:]}"
+                )
+            if "Traceback (most recent call last)" in output:
+                problems.append(f"{label}: the gate crashed instead of reaching a verdict")
+
+            ok = rc == want_rc and (
+                want_message is None or has_message == want_message
+            )
+            verdict = "caught" if rc != 0 else "silent"
+            print(f"  {'ok' if ok else 'WRONG':>5}  {label} -> rc={rc} ({verdict})")
+
     return problems
 
 
@@ -670,6 +857,16 @@ def main() -> int:
     except MutationFailed as exc:
         problems.append(f"the working-tree assertion could not be checked: {exc}")
 
+    print(
+        "\nWorking-tree verdict -- driven end to end against a scratch "
+        "checkout, because calling `_tree_state` proves the snapshot works, "
+        "not that a dirty tree fails:"
+    )
+    try:
+        problems.extend(check_tree_verdict())
+    except MutationFailed as exc:
+        problems.append(f"the working-tree verdict could not be checked: {exc}")
+
     print()
     if problems:
         print(
@@ -680,12 +877,17 @@ def main() -> int:
         return 1
     # Counted, not assumed. The previous version printed
     # `len(MUST_FAIL) + len(STRUCTURAL)` under the words "rejected", which
-    # overstated the result by 17%: four of the STRUCTURAL cases expect exit 0,
-    # because the gate is *supposed* to accept those documents. They are real
-    # cases and worth running -- a rule that rejects a well-formed document is
-    # just as broken as one that misses a defect -- but calling them "rejected"
-    # claims evidence that does not exist, in the one line a reader is most
-    # likely to quote when auditing what this gate proved.
+    # counted every case in both lists as a rejection even though several
+    # STRUCTURAL cases expect exit 0, because the gate is *supposed* to accept
+    # those documents. They are real cases and worth running -- a rule that
+    # rejects a well-formed document is just as broken as one that misses a
+    # defect -- but calling them "rejected" claims evidence that does not exist,
+    # in the one line a reader is most likely to quote when auditing what this
+    # gate proved.
+    #
+    # No percentage is quoted here. An earlier version of this comment gave
+    # "17%" and "four", which went stale the moment this round added a case --
+    # the same drift the count itself exists to prevent, one paragraph up.
     rejected = sum(1 for case in (*MUST_FAIL, *STRUCTURAL) if case.expect_rc != 0)
     accepted_defects = len(MUST_FAIL) + len(STRUCTURAL) - rejected
     print(
@@ -693,7 +895,9 @@ def main() -> int:
         f"correctly accepted {accepted_defects} well-formed document(s) it must "
         f"not reject, accepted {len(MUST_PASS)} good README(s), executed no "
         f"command substitution, saw a real tree change and refused a broken git "
-        f"instead of skipping on it, and did not confuse a crash with a verdict."
+        f"instead of skipping on it, failed a run whose documented command wrote "
+        f"into the checkout and went quiet once that assertion was disarmed, and "
+        f"did not confuse a crash with a verdict."
     )
     return 0
 

@@ -70,15 +70,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import sys
 from pathlib import Path
 
-# Modules that can open a network connection, or that can be made to.
-#
-# `http` and `urllib` are packages rather than leaf modules, so importing
-# `http.client` names `http` at the top level; that is what this set matches on.
-# `asyncio` is here because `asyncio.open_connection` and the `*-connector`
-# helpers reach a socket, even though the name alone promises nothing.
 # Modules that can open a network connection, or that can be made to.
 #
 # `http` and `urllib` are packages rather than leaf modules, so importing
@@ -215,6 +210,42 @@ SELF_TEST_CASES: tuple[tuple[str, str, bool], ...] = (
     ("boto3_client.py", "import boto3\n", True),
     # Lookalikes, which must stay accepted or the list grows by accident.
     ("lookalike.py", "import socket_helpers\nfrom sockets import bind\n", False),
+    # One written-out case per remaining entry in NETWORK_MODULES, so that
+    # deleting any name from the list turns this suite red: the file still
+    # imports the deleted name, the scan stops reporting it, and the per-case
+    # loop below fails on the difference.
+    #
+    # These had no case at all, and a reviewer noticed by deleting `botocore`
+    # and `asyncio` and watching the gate stay green -- which matters most for
+    # `asyncio`, because the comment above the list argues specifically for its
+    # presence. An entry justified in prose and tested by nothing is an entry
+    # that can be deleted by anyone who does not read the prose.
+    #
+    # Written out by hand, deliberately. An earlier version generated these from
+    # `NETWORK_MODULES`, which reads like coverage and is not: the generator
+    # would emit its own case from the list, so deleting the name removed the
+    # test along with the thing being tested. A test generated from the value it
+    # constrains cannot fail on a change to that value.
+    # `http` and `requests` were uncovered too. They were missing because the
+    # review that spotted the other thirteen had subtracted `REQUIRED_NETWORK_MODULES`
+    # first, on the reasonable theory that the floor already guards them -- which is
+    # true of *losing the name* and false of *losing the test*, since the floor and
+    # the synthetic cases are independent mechanisms.
+    ("http_client.py", "import http.client\n", True),
+    ("requests_get.py", "import requests\n", True),
+    ("asyncio_connection.py", "import asyncio\n", True),
+    ("botocore_session.py", "import botocore.session\n", True),
+    ("ftplib_client.py", "from ftplib import FTP\n", True),
+    ("grpc_channel.py", "import grpc\n", True),
+    ("imaplib_client.py", "import imaplib\n", True),
+    ("nntplib_client.py", "import nntplib\n", True),
+    ("poplib_client.py", "import poplib\n", True),
+    ("smtplib_client.py", "import smtplib\n", True),
+    ("socks_transport.py", "import socks\n", True),
+    ("telnetlib_client.py", "import telnetlib\n", True),
+    ("urllib3_pool.py", "import urllib3\n", True),
+    ("websockets_client.py", "import websockets\n", True),
+    ("xmlrpc_server.py", "import xmlrpc.client\n", True),
     ("comment.py", "# import socket\n'''import ssl'''\n", False),
     ("string.py", 'PATH = "socket/host.py"\n', False),
 )
@@ -229,6 +260,24 @@ def missing_required_modules() -> list[str]:
     names matter. The names below are checked against the list directly instead.
     """
     return [name for name in REQUIRED_NETWORK_MODULES if name not in NETWORK_MODULES]
+
+
+def untested_modules() -> list[str]:
+    """Entries of `NETWORK_MODULES` that no synthetic case would catch deleting.
+
+    The self-test cases for the list entries are generated from the list, so
+    this is structurally satisfied today. It is asserted anyway, because the
+    cheap way to break it is to replace the generator with a hand-written tuple
+    -- which is how every other case list in this file is written, and all four
+    of those went stale at some point. A test that cannot detect its own
+    replacement is worth less than it looks.
+    """
+    sources = "\n".join(source for _name, source, _expected in SELF_TEST_CASES)
+    return [
+        name
+        for name in sorted(NETWORK_MODULES)
+        if not re.search(rf"\b{re.escape(name)}\b", sources)
+    ]
 
 
 def self_test() -> int:
@@ -246,6 +295,11 @@ def self_test() -> int:
             f"NETWORK_MODULES no longer contains {name!r}, a well-known "
             f"network client. Dropping a name is the silent direction: no "
             f"synthetic file in this self-test would ever import it."
+        )
+    for name in untested_modules():
+        problems.append(
+            f"NETWORK_MODULES contains {name!r} but no synthetic case imports "
+            f"it, so deleting the name would leave this self-test green."
         )
     with tempfile.TemporaryDirectory(prefix="toxindb-net-") as scratch:
         root = Path(scratch)
