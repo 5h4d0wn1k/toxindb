@@ -47,6 +47,14 @@ def _build_parser() -> argparse.ArgumentParser:
     canary_p.add_argument("--target", type=str, default=None)
     canary_p.add_argument("--seed", type=str, default="demo")
     canary_p.add_argument("--plant", action="store_true")
+    canary_p.add_argument(
+        "--at",
+        type=float,
+        default=None,
+        metavar="TIMESTAMP",
+        help="Timestamp for the planted canary (default: the trace's own "
+             "latest event, so the plant lands inside the recency windows)",
+    )
     canary_p.add_argument("--monitor", action="store_true")
 
     prov_p = sub.add_parser("provenance", parents=[common],
@@ -89,17 +97,85 @@ def cmd_monitor(args) -> int:
     return 0
 
 
+def _plant_timestamp(trace: Trace) -> float:
+    """When to stamp a planted canary, in the trace's own time.
+
+    This used to be hardcoded to `999999.0` (1970-01-12). Every recency window
+    in the tool is measured as `event.timestamp - doc.timestamp`, so on any
+    trace carrying real epoch timestamps the planted document sat outside every
+    window by decades: TX-001 counted 0 of the retrieved canary docs as recent
+    and TX-004 never fired. Verified on a trace at 1.75e9 -- the plant was 55.4
+    years old and produced 0 canary alerts out of 9. Since `--plant` is the
+    documented way to prove detection works, a plant that cannot be detected
+    defeats the command's entire purpose.
+
+    The latest timestamp already in the trace, rather than wall-clock, for
+    three reasons. It keeps the tool deterministic, which is a hard invariant
+    and the reason the demo is byte-comparable across runs. It needs no clock,
+    which is the same reason every timestamp here is read from the trace. And it
+    cannot land in the future relative to the queries that would retrieve it,
+    which several windows would read as a negative age.
+
+    Falls back to `999999.0` for an empty trace, so the old constant survives
+    only where it is the only answer available. `trace_gen` bases its fixtures
+    near `1_000_000.0`, which is why the hardcoded value looked plausible: the
+    bundled demo hid the defect rather than disproving it.
+    """
+    stamps = [e.timestamp for e in (*trace.ingests, *trace.queries)]
+    return max(stamps) if stamps else 999999.0
+
+
+def _plant_output_path(trace_path: str) -> str:
+    """Where a planted trace goes, derived from the input's final extension.
+
+    Never by substring replacement. `str.replace` takes no occurrence count, so
+    the old `trace_path.replace(".jsonl", "_canary_planted.jsonl")` was a no-op
+    whenever the path contained no `.jsonl` -- `out_path` silently fell back to
+    the input path, and `canary --plant` appended two canary records to the
+    operator's own evidence file, printed the input path as the destination,
+    and exited 0. With no occurrence count it also rewrote every occurrence, so
+    `a.jsonl.b.jsonl` came out as `a_canary_planted.jsonl.b_canary_planted.jsonl`.
+
+    `os.path.splitext` splits the last extension only, which is what a suffix
+    means, and returns the stem unchanged when there is no extension at all.
+    """
+    base, _ext = os.path.splitext(trace_path)
+    return f"{base}_canary_planted.jsonl"
+
+
 def cmd_canary(args) -> int:
     trace_path = _resolve_trace(args)
     if not trace_path:
         print("Error: no trace file specified.", file=sys.stderr)
         return 1
+    if os.path.isdir(trace_path):
+        # Checked before reading, because `Trace.from_jsonl` raises
+        # `IsADirectoryError` naming a path the operator never asked for. A
+        # directory ending in `.jsonl` is a plausible mount layout, so this is
+        # reachable rather than theoretical.
+        print(
+            f"Error: {trace_path} is a directory, not a trace file.",
+            file=sys.stderr,
+        )
+        return 1
     trace = Trace.from_jsonl(trace_path)
 
     if getattr(args, "plant", False):
         canary = generate_canary(args.seed)
-        plant_canary_in_trace(trace, canary, timestamp=999999.0)
-        out_path = trace_path.replace(".jsonl", "_canary_planted.jsonl")
+        requested = getattr(args, "at", None)
+        if requested is not None:
+            timestamp = requested
+        else:
+            timestamp = _plant_timestamp(trace)
+        plant_canary_in_trace(trace, canary, timestamp=timestamp)
+        out_path = _plant_output_path(trace_path)
+        if os.path.abspath(out_path) == os.path.abspath(trace_path):
+            # Unreachable via `_plant_output_path` as written, and kept as a
+            # standing guard rather than an assumption. Overwriting the input
+            # is the one failure here that destroys data rather than reporting
+            # it, and this is the line that would do it.
+            print("Error: refusing to overwrite the input trace.", file=sys.stderr)
+            return 1
         trace.to_jsonl(out_path)
         print(f"Planted canary {canary.claim_id} -> {out_path}")
         return 0

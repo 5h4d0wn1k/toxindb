@@ -148,7 +148,7 @@ Global flags apply to every subcommand:
 
 ```
 toxindb monitor   TRACE [--output DIR] [--verbose] [--target PATH]
-toxindb canary    TRACE [--plant] [--monitor] [--seed SEED] [--output DIR]
+toxindb canary    TRACE [--plant] [--monitor] [--seed SEED] [--at TS] [--output DIR]
 toxindb provenance TRACE [--output DIR] [--verbose]
 toxindb report    TRACE [--format md|json] [--output DIR]
 toxindb demo      [--output DIR] [--verbose]
@@ -172,7 +172,12 @@ toxindb canary examples/traces/clean_trace.jsonl --plant --seed my-claim   # wri
 ```
 
 `--plant` generates a deterministic canary claim, adds it as an ingest event with
-a pseudo-confidential marker, and writes `<trace>_canary_planted.jsonl`.
+a pseudo-confidential marker, and writes `<stem>_canary_planted.jsonl` beside the
+input — the stem is the trace path with its final extension removed, so
+`ingest_log` becomes `ingest_log_canary_planted.jsonl`. Your input file is never
+modified. `--at TIMESTAMP` overrides when the canary is stamped; by default it
+takes the trace's own latest timestamp, so the plant lands inside the recency
+windows rather than decades outside them.
 `--monitor` scans query outputs for canary-text resurgence and writes
 `reports/canary_report.json`.
 
