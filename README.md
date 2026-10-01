@@ -164,7 +164,7 @@ Emits `reports/alerts.jsonl` — one JSON object per alert:
 
 ```bash
 toxindb canary examples/traces/canary_trace.jsonl --monitor --output reports/
-toxindb canary some_trace.jsonl --plant --seed my-claim   # write a planted trace
+toxindb canary examples/traces/clean_trace.jsonl --plant --seed my-claim   # write a planted trace
 ```
 
 `--plant` generates a deterministic canary claim, adds it as an ingest event with

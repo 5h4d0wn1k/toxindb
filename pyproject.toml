@@ -19,7 +19,19 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
+]
+
+[project.optional-dependencies]
+# The core stays stdlib-only by design (see SCOPE.md). Everything a
+# contributor needs is pinned to a lower bound only, and lives here rather
+# than in CI so that `pip install -e ".[dev]"` is reproducible.
+# CONTRIBUTING.md has always documented this extra; it simply did not exist.
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
 ]
 
 [project.scripts]
@@ -34,3 +46,34 @@ toxindb = ["../examples/traces/*.json"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["toxindb"]
+# __main__ is a `python -m toxindb` shim and is exercised by the CLI tests via
+# the console-script entry point, so it is not worth a coverage ratchet.
+omit = ["toxindb/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# Currently 97%. The gate is set below the real number so it fails on a
+# regression, not on ordinary churn, and is expected to be ratcheted upward
+# as new code lands.
+fail_under = 95
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# The gate starts at the correctness-critical subset only: syntax errors and
+# undefined/redefined names. That set passes today, so the gate is real rather
+# than aspirational.
+#
+# The wider default rule set reports 159 findings, essentially all cosmetic
+# modernisation (52 PEP 585 annotations, 30 import ordering, 28 unused
+# imports, 14 deprecated typing imports). Those are worth fixing, but they are
+# mechanical, so they belong in a dedicated style pass rather than being
+# mixed into behavioural changes. Once that lands, widen `select` here to
+# match, and the gate will keep them fixed from then on.
+select = ["E9", "F63", "F7", "F82"]
