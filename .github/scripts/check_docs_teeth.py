@@ -457,15 +457,116 @@ STRUCTURAL = [
         expect="FAIL  README.md:10    toxindb nosuchsubcommand",
     ),
     # ...and the control for that one: with the shorter fence treated as an
-    # opener rather than content, the *inner* block closes at line 4 and the
-    # ```bash block is never reached at all, so no `FAIL` is printed for a
-    # command that is right there in the document.
+    # opener rather than content, the *inner* block opens at line 4 and closes at
+    # line 6, so the ```` at line 7 opens a second block that is never closed --
+    # and the ```bash block after it is never reached, so no `FAIL` is printed
+    # for a command that is right there in the document. That second unclosed
+    # block is where the *second* error came from, not from line 4.
     Case(
         "and the block after such a fence is still reached",
         "# Synthetic\n\n````markdown\n```\nx\n```\n````\n\n"
         "```bash\ntoxindb --version\n```\n",
         0,
         expect="PASS  README.md:10    toxindb --version",
+    ),
+    # The *character* half of the same rule, in the other direction. The
+    # `ignoring` branch had the length half but not the character half, so a
+    # ``` fence inside a ~~~text fence was treated as significant: the balanced
+    # ~~~text block was reported unterminated, the content was then opened as a
+    # new block, and the ```bash after it was swallowed. The document renders
+    # as two blocks with the second one real -- checked against
+    # `commonmark.commonmark`. Nothing in this README has a tilde fence, so
+    # this cannot fire on the current file, which is exactly why it needs a
+    # case rather than a reviewer's eye.
+    #
+    #     1 # Synthetic  2 (blank)  3 ~~~text  4 ```  5 x  6 ```  7 ~~~
+    #     8 (blank)  9 ```bash  10 the command  11 ```
+    Case(
+        "a backtick fence inside a tilde fence is content, not a block",
+        "# Synthetic\n\n~~~text\n```\nx\n```\n~~~\n\n"
+        "```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect="FAIL  README.md:10    toxindb nosuchsubcommand",
+    ),
+    # The control for the control: if the ``` inside ~~~text were accepted as a
+    # *closer*, the ~~~text block would end at line 6, the ~~~ at line 7 would
+    # open a new fence, and the command at line 10 would never be run at all.
+    Case(
+        "and the block after a tilde fence is still reached",
+        "# Synthetic\n\n~~~text\n```\nx\n```\n~~~\n\n"
+        "```bash\ntoxindb --version\n```\n",
+        0,
+        expect="PASS  README.md:10    toxindb --version",
+    ),
+    # A fence indented four spaces is an *indented code block* -- prose -- and
+    # `cmark` renders it as such. Treating it as a fence meant the gate executed
+    # command text the document never claims is runnable, and reported FAIL for
+    # it. An indented ` ```bash ` block is what a fence inside an indented list
+    # or after a wrapped paragraph looks like, so this is not a contrived input.
+    #
+    # rc 2, not 0: this document's only block is prose, so the gate finds no
+    # shell blocks and refuses to pass vacuously, saying so. That is the
+    # outcome worth pinning. Before the fix the block was read as a fence, the
+    # command was executed, and the gate printed
+    # `FAIL README.md:4 toxindb nosuchsubcommand` for a line the document
+    # renders as prose. The load-bearing assertion is the absence of that
+    # `FAIL`, plus a named reason for the refusal.
+    Case(
+        "a fence indented four spaces is prose, not a runnable block",
+        "# Synthetic\n\n    ```bash\n    toxindb nosuchsubcommand\n    ```\n",
+        2,
+        expect="no ```bash blocks found",
+    ),
+    # ...and the control, because a fix for the above that simply forbade all
+    # indentation would pass it while breaking the ordinary three-space form,
+    # which is how a fence inside a list item is written.
+    Case(
+        "a fence indented three spaces is still a fence",
+        "# Synthetic\n\n   ```bash\n   toxindb --version\n   ```\n",
+        0,
+        expect="PASS  README.md:4     toxindb --version",
+    ),
+    # A backtick fence's info string may not contain a backtick, so
+    # ```ba`sh is a paragraph in CommonMark. `_SHELL_WORDS` still found `sh` at
+    # a word boundary, so the block was collected and executed. The refusal
+    # here is the point: a document that does not document a command must not
+    # have one run, and the two `::error::` lines say the structure is broken
+    # rather than silently reporting zero commands.
+    Case(
+        "a backtick in a backtick info string does not make a fence",
+        "# Synthetic\n\n```ba`sh\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect="is never closed",
+    ),
+    # The control: a *tilde* fence may carry a backtick in its info string, so a
+    # fix that rejected the info string generally rather than only for backtick
+    # fences would pass the case above and break this one.
+    Case(
+        "and a tilde fence may carry a backtick in its info string",
+        "# Synthetic\n\n~~~ba`sh\ntoxindb --version\n~~~\n",
+        0,
+        expect="PASS  README.md:4     toxindb --version",
+    ),
+    # `> ` is a block-quote marker only inside a block quote. In a plain ```bash
+    # block it is ordinary content, and a session transcript is written exactly
+    # that way. Stripping it unconditionally made the gate *execute* the quoted
+    # line. A fence genuinely inside a block quote still has to work, so the
+    # marker is now stripped per-block, decided at the opener.
+    Case(
+        "a fence inside a block quote is still a shell block",
+        "# Synthetic\n\n> ```bash\n> toxindb nosuchsubcommand\n> ```\n",
+        1,
+        expect="FAIL  README.md:4     toxindb nosuchsubcommand",
+    ),
+    # A fence on a list-item bullet. The marker used to hide the opener, so the
+    # closing ``` was read as a new unlabelled opener which swallowed the next
+    # real block, and the document failed with "no ```bash blocks found" while
+    # containing one.
+    Case(
+        "a fence on a list-item bullet is still a shell block",
+        "# Synthetic\n\n- ```bash\n  toxindb nosuchsubcommand\n  ```\n",
+        1,
+        expect="FAIL  README.md:4     toxindb nosuchsubcommand",
     ),
 ]
 

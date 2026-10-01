@@ -570,7 +570,22 @@ def _is_byte_code_cache(line: str) -> bool:
     return "__pycache__" in path.split("/") or path.endswith(".pyc")
 
 
-_FENCE = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*(?P<info>.*?)\s*$")
+# At most three leading spaces. CommonMark: "If the opening code fence is
+# indented N spaces, then N <= 3". Four or more is an *indented code block*,
+# which is ordinary prose -- so a fence indented by a tab or by four spaces is
+# not a fence, and treating it as one executes text the document never claims is
+# runnable. That was reachable: an indented
+#
+#     ```bash
+#     toxindb nosuchsubcommand
+#     ```
+#
+# is what a fenced block looks like inside an indented list or after a wrapped
+# paragraph, and the gate ran the command and reported FAIL for it. `cmark`
+# renders that input as a single indented code block. `\s*` matched tabs too,
+# and a tab advances to the next 4-column stop, so a tab-indented fence is also
+# 4 columns and also not a fence.
+_FENCE = re.compile(r"^ {0,3}(?P<ticks>`{3,}|~{3,})\s*(?P<info>.*?)\s*$")
 # Info strings that mean "these lines are shell commands". Attribute-suffixed
 # forms count, because ```bash,ignore and ```{.bash} are the same thing as
 # ```bash and matching only the literal string made this gate fail the day the
@@ -578,11 +593,44 @@ _FENCE = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*(?P<info>.*?)\s*$")
 _SHELL_WORDS = re.compile(
     r"\b(?:sh|bash|zsh|shell|console|shell-session|shellsession)\b", re.IGNORECASE
 )
-_UNLABELLED = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*$")
+_UNLABELLED = re.compile(r"^ {0,3}(?P<ticks>`{3,}|~{3,})\s*$")
+
+
+def _fence_or_none(match: re.Match | None) -> re.Match | None:
+    """`_FENCE` matches that CommonMark would also call a fence.
+
+    One extra rule, and it is the reason this is a function rather than a bare
+    ``if fence_match``: for a *backtick* fence the info string may not contain a
+    backtick. `` ```ba`sh `` is therefore not a fence at all -- `cmark` renders
+    it as a paragraph -- but `_SHELL_WORDS` still found `sh` at a word boundary
+    inside the info string, so the gate collected the following lines as a shell
+    block and executed them. Tilde fences have no such restriction.
+    """
+    if match is None:
+        return None
+    if match.group("ticks")[0] == "`" and "`" in match.groupdict().get("info", ""):
+        return None
+    return match
 
 
 def _is_shell_info(info: str) -> bool:
     return bool(_SHELL_WORDS.search(info.strip("{}").replace(".", " ")))
+
+
+def _closes_or_outgrows(candidate: re.Match, opener: str) -> bool:
+    """Whether `candidate` is the opener's closing fence, or long enough to be a new one.
+
+    CommonMark's rule for ending a code block is *same fence character* **and**
+    *at least as many characters as the opening fence*. Both halves matter and
+    dropping either is a false failure on a valid document, which is how this
+    went wrong twice: the `bash` branch first had only the character half, then
+    the `ignoring` branch had only the length half.
+
+    Shared by both branches so a third divergence cannot be introduced by
+    editing one of them.
+    """
+    ticks = candidate.group("ticks")
+    return ticks[0] == opener[0] and len(ticks) >= len(opener)
 
 
 # A block-quote marker in front of a line. CommonMark allows a fenced code
@@ -591,10 +639,18 @@ def _is_shell_info(info: str) -> bool:
 # the line, so the marker stopped it matching, and a `> ```bash` block holding a
 # documented bad command was never run -- silently, with no skip reason, while
 # the `ran == 0` floor stayed satisfied by whatever other block the document
-# had. Stripped rather than specially handled, which over-scans: CommonMark lazy
-# continuation and nesting are not modelled, and scanning content that a strict
-# reader would call quote text can only find a command earlier, never later.
+# had.
 _QUOTE_PREFIX = re.compile(r"^ {0,3}(?:>[ \t]?)+")
+
+# A list-item marker in front of a line. CommonMark likewise allows a fence
+# inside a list item, and `- ```bash` is one. That was a false failure with a
+# misleading diagnosis: the marker stopped `_FENCE` matching, so the line was
+# ignored and the *closing* ``` was read as the opening of a new unlabelled
+# block, which swallowed the next real block. The document then failed with
+# "no ```bash blocks found" while containing one. The three-space-indented form
+# (`   ```bash`, which is what a list item looks like once the marker is on the
+# previous line) always worked.
+_LIST_MARKER = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+")
 
 
 def _report_unterminated(line_no: int, message: str, sink: list[int]) -> None:
@@ -639,17 +695,43 @@ def extract_shell_blocks(
     in_block = False
     ignoring = ""
     ignoring_start = 0
+    # Whether the fence currently open was itself opened inside a block quote.
+    # Decides whether `> ` is a container marker to be stripped from the lines
+    # that follow, or literal content. It has to be decided at the opener,
+    # because the two cases are indistinguishable from inside the block: a
+    # session transcript inside a ```bash block is written
+    #
+    #     ```bash
+    #     > toxindb nosuchsubcommand
+    #     ```
+    #
+    # and stripping the marker there made the gate *execute* a line the document
+    # presents as quoted prompt text. Inside a real block quote the same marker
+    # is structure and does have to go, so the flag is set when a quote marker is
+    # seen on the opening line and consulted for every line of that block.
+    quoted = False
     shell = False
     fence = ""
     start = 0
     body: list[str] = []
-    for number, line in enumerate(lines, 1):
-        line = _QUOTE_PREFIX.sub("", line)
-        fence_match = _FENCE.match(line)
+    for number, raw in enumerate(lines, 1):
+        in_quote = _QUOTE_PREFIX.match(raw) is not None
+        line = _QUOTE_PREFIX.sub("", raw)
+        if not _LIST_MARKER.match(line):
+            # A list marker only ever precedes a fence *opener*; the body and
+            # the closer of a list-nested block are indented instead.
+            pass
+        else:
+            line = _LIST_MARKER.sub("", line, count=1)
+        fence_match = _fence_or_none(_FENCE.match(line))
         if ignoring:
+            if not quoted:
+                line = raw
             # Inside a fence we are deliberately not reading. Only its own
             # closing fence can end it -- and a closing fence has, by
-            # definition, no info string.
+            # definition, no info string, the same fence character, and at least
+            # as many characters as the opener. All three halves, because
+            # omitting any one of them is a false failure on a valid document.
             if (
                 fence_match
                 and fence_match.group("info") == ""
@@ -657,8 +739,9 @@ def extract_shell_blocks(
                 and len(fence_match.group("ticks")) >= len(ignoring)
             ):
                 ignoring = ""
+                quoted = False
                 continue
-            if fence_match and len(fence_match.group("ticks")) >= len(ignoring):
+            if fence_match and _closes_or_outgrows(fence_match, ignoring):
                 # A fence carrying an info string cannot close the fence we are
                 # skipping, so that fence is still open. This is the silent
                 # version of the defect the check below reports: a forgotten
@@ -677,27 +760,31 @@ def extract_shell_blocks(
                 # over-scans in preference to missing a command, and it has
                 # already said the structure is broken.
                 #
-                # Only a fence *at least as long* as the opener can trigger this.
-                # A shorter one is ordinary content, in CommonMark and here: the
-                # closing rule is the same length rule used for `bash` blocks
-                # below, and applying it to only one of the two branches is how
-                # this went wrong. A 3-backtick fence inside a 4-backtick
-                # ````markdown block is the ordinary way to document a fenced
-                # block, and this branch used to report the outer fence
-                # unterminated and then open the *content* as a new block --
-                # swallowing the ```bash after it and failing a document that
-                # every CommonMark renderer accepts. Checked against
-                # `commonmark.commonmark`, which renders exactly that input as
-                # two blocks with the second one real.
+                # `_closes_or_outgrows` is the *whole* CommonMark rule -- same
+                # character **and** at least as long -- and it is a shared
+                # function because this branch previously had only the length
+                # half, and the branch below already had both. That is exactly
+                # how a 3-backtick fence inside a 4-backtick ````markdown block
+                # came to report the outer fence unterminated and then open the
+                # *content* as a new block, swallowing the ```bash after it and
+                # failing a document every CommonMark renderer accepts. The same
+                # mistake in the other character direction: a ``` fence inside
+                # a ~~~text fence is content, since the closing fence must use
+                # the opener's character, and this branch used to report the
+                # balanced `~~~text` block unterminated and execute command text
+                # out of it. Both verified against `commonmark.commonmark`, which
+                # renders either input as two blocks with the second one real.
                 _report_unterminated(
                     ignoring_start,
                     f"non-shell code fence opened here is never closed",
                     unterminated,
                 )
                 ignoring = ""
+                quoted = False
             else:
-                # Either not a fence at all, or one too short to close or to
-                # open anything. Content, and skipped like any other.
+                # Either not a fence at all, or one that can neither close the
+                # fence we are in nor open a new one. Content, and skipped like
+                # any other.
                 continue
         if not in_block:
             if not fence_match:
@@ -705,6 +792,7 @@ def extract_shell_blocks(
             info = fence_match.group("info")
             plain = _UNLABELLED.match(line)
             shell = _is_shell_info(info) if info else False
+            quoted = in_quote
             if not shell and not plain:
                 # An explicitly non-shell fence (python, json, text, ...).
                 # `ignoring_start` is kept because the unterminated report below
@@ -718,6 +806,8 @@ def extract_shell_blocks(
             fence = fence_match.group("ticks")
             start, body = number, []
             continue
+        if not quoted:
+            line = raw
         # Closing fence: same character, no info string, and *at least* as long
         # as the opener. CommonMark requires that last part, and comparing only
         # the fence *character* is what let a 3-backtick line close a 4-backtick
@@ -727,15 +817,11 @@ def extract_shell_blocks(
         # command after the short closer the gate exited 0 with one command
         # executed, and with no real closer at all it reported no unclosed-fence
         # error, because the block looked closed.
-        closing = _UNLABELLED.match(line)
-        if (
-            closing
-            and closing.group("ticks")[0] == fence[0]
-            and len(closing.group("ticks")) >= len(fence)
-        ):
+        closing = _fence_or_none(_UNLABELLED.match(line))
+        if closing and _closes_or_outgrows(closing, fence):
             (shell_blocks if shell else unlabelled).append((start, body))
             in_block = False
-            fence, shell = "", False
+            fence, shell, quoted = "", False, False
             continue
         body.append(line)
     if in_block:
