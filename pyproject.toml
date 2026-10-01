@@ -63,12 +63,13 @@ show_missing = true
 # into a red build. The threshold is a property of the CI gate, not of the
 # project, so it is passed as `--cov-fail-under` by the workflow instead.
 #
-# Nothing is omitted either. `toxindb/__main__.py` is a two-line `python -m
-# toxindb` shim and measures 0%, because the console-script entry point
-# (`toxindb.cli:main`) does not import it and subprocess coverage is not
-# enabled. Excluding it would have meant justifying an exclusion that is not
-# actually about reachability; leaving it in costs 0.34 points and stays
-# honest.
+# Nothing is omitted either. `toxindb/__main__.py` holds three statements --
+# `import sys`, `from .cli import main`, `sys.exit(main())` -- and measures 0%,
+# because the console-script entry point (`toxindb.cli:main`) does not import it
+# and subprocess coverage is not enabled. The justification this comment
+# previously carried ("a `python -m toxindb` shim is not worth a ratchet") was
+# not about reachability, and the file is not exercised by any test. Leaving it
+# in costs 0.34 points (97.67% -> 97.33%) and stays honest about that.
 
 [tool.ruff]
 target-version = "py310"
@@ -79,10 +80,18 @@ line-length = 100
 # undefined names, and redefined names (F811). That set passes today, so the
 # gate is real rather than aspirational.
 #
-# The wider default rule set reports 159 findings, essentially all cosmetic
-# modernisation (52 PEP 585 annotations, 30 import ordering, 28 unused
-# imports, 14 deprecated typing imports). Those are worth fixing, but they are
-# mechanical, so they belong in a dedicated style pass rather than being
-# mixed into behavioural changes. Once that lands, widen `select` here to
-# match, and the gate will keep them fixed from then on.
+# The next rung up is `E,F,I,UP`, which reports 168 findings across
+# toxindb/ and tests/ -- 52 PEP 585 annotations, 30 import ordering, 28 unused
+# imports, 14 deprecated typing imports, 17 over-long lines, and a tail of
+# f-strings with no placeholders, unused variables and ambiguous names
+# (`ruff check toxindb/ tests/ --isolated --select E,F,I,UP`). Those are worth
+# fixing, but they are mechanical, so they belong in a dedicated style pass
+# rather than being mixed into behavioural changes. Once that lands, widen
+# `select` here to match and the gate will keep them fixed from then on.
+#
+# The full `--select ALL` ruleset reports 947, and roughly half of that is
+# opinion this project has no reason to adopt: 211 asserts, 161 undocumented
+# public functions, 139 missing return annotations, 35 missing copyright
+# notices, 86 prints. Those are style positions, not defects, so the number is
+# recorded here to show what is deliberately *not* being enforced.
 select = ["E9", "F63", "F7", "F811", "F82"]

