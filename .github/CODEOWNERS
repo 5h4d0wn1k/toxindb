@@ -1,0 +1,32 @@
+# Code owners for toxindb.
+#
+# toxindb is a small, security-sensitive detector: a change that makes a
+# heuristic stop firing is a change that breaks its entire reason for existing.
+# These rules make that somebody's explicit job.
+
+# Default owner for everything not matched below.
+*                               @5h4d0wn1k
+
+# The heuristics themselves. Each TX-NNN gates whether a poisoning pattern is
+# detected at all, so changes here need the owner and a test that proves the
+# heuristic still fires on a poison trace and stays quiet on a clean one.
+/toxindb/heuristics.py         @5h4d0wn1k
+/toxindb/engine.py             @5h4d0wn1k
+/toxindb/canary.py             @5h4d0wn1k
+/toxindb/provenance.py         @5h4d0wn1k
+
+# Trace parsing and the input schema. A silent schema change here would make
+# every heuristic wrong at once without any of them failing their own test.
+/toxindb/trace.py              @5h4d0wn1k
+/toxindb/trace_gen.py          @5h4d0wn1k
+
+# Detection output. Report/alert formats are consumed by other tooling.
+/toxindb/report.py             @5h4d0wn1k
+/toxindb/cli.py                @5h4d0wn1k
+
+# Legal, ethics, and scope documents define the boundary of intended use.
+/ETHICS.md                     @5h4d0wn1k
+/SCOPE.md                      @5h4d0wn1k
+/SECURITY.md                   @5h4d0wn1k
+/CODE_OF_CONDUCT.md            @5h4d0wn1k
+/NOTICE.md                     @5h4d0wn1k

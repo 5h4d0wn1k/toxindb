@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/5h4d0wn1k/toxindb/blob/main/SECURITY.md
+    about: Read the responsible-disclosure policy. Please do not open a public issue for a vulnerability.
+  - name: Ethics, scope, and acceptable use
+    url: https://github.com/5h4d0wn1k/toxindb/blob/main/ETHICS.md
+    about: What toxindb may and may not be used for. Questions about scope belong here.
+  - name: Contributing guide
+    url: https://github.com/5h4d0wn1k/toxindb/blob/main/CONTRIBUTING.md
+    about: Dev setup, code standards, the TX-NNN naming convention, and PR expectations.
