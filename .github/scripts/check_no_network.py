@@ -36,14 +36,19 @@ stops mattering.
 Usage
 -----
     python .github/scripts/check_no_network.py toxindb
-    python .github/scripts/check_no_network.py --self-test toxindb
 
-`--self-test` runs the scanner over synthetic trees it builds itself -- one
-clean, several of which must be rejected -- and then scans the real tree. A gate
-whose own detector is never watched to reject anything is the failure this
-repository has already made twice, so the teeth test lives in the same file as
-the gate and runs in the same CI step. It is not a separate script because a
-separate script is one more thing that can quietly stop running.
+Every run first checks the scanner against synthetic trees it builds itself --
+several that must be rejected, several that must be accepted -- and then scans
+the real tree. A gate whose own detector is never watched to reject anything is
+the failure this repository has already made twice, so the teeth test lives in
+the same file as the gate and runs in the same CI step. It is not a separate
+script because a separate script is one more thing that can quietly stop running.
+
+There is no flag to turn it off, and that is deliberate. An earlier version took
+``--self-test`` and then ran the self-test unconditionally, so the flag did
+nothing while its help text described it as "(default: on)" -- a reader would
+reasonably conclude that omitting it skipped the check. A gate cannot defend
+itself with a switch nobody needs, so the switch is gone.
 """
 
 from __future__ import annotations
@@ -208,21 +213,22 @@ def main() -> int:
     parser.add_argument(
         "root",
         type=Path,
+        nargs="?",
         help="directory to scan (a package directory, not its parent)",
-    )
-    parser.add_argument(
-        "--self-test",
-        action="store_true",
-        help="prove the scanner can reject before scanning (default: on)",
     )
     args = parser.parse_args()
 
+    # The self-test runs unconditionally, before the root is even validated:
+    # it is evidence that this script works, not an option for this
+    # invocation. See the module docstring on why there is no flag for it.
+    if self_test() != 0:
+        return 1
+
+    if args.root is None:
+        parser.error("a directory to scan is required")
     if not args.root.is_dir():
         print(f"error: {args.root} is not a directory", file=sys.stderr)
         return 2
-
-    if self_test() != 0:
-        return 1
 
     offenders = scan(args.root)
     if offenders:

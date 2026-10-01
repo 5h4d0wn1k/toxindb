@@ -83,6 +83,13 @@ _ATX_HEADING = re.compile(r"^\s{0,3}(#{1,6})(?!#)")
 # resolved with lookahead in `_heading_levels` rather than by matching a line in
 # isolation -- a `---` thematic break must not be mistaken for one.
 _SETEXT_HEADING = re.compile(r"^\s{0,3}(=+|-{2,})\s*$")
+# A fenced code block, opened or closed. Only the line shape matters here:
+# `_heading_levels` needs to know which lines are *not* headings, and a
+# fence is the one construct that reliably hides them. Deliberately the
+# same permissive shape as the docs gate's `_FENCE`, so a report that
+# documents a command and a gate that reads a report agree on where the
+# fences are.
+_FENCE = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*(?P<info>.*?)\s*$")
 _TX_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*(TX-\d+)")
 _GENERATED_LINE = re.compile(r"^\s*(?:[-*+]\s+)?\*\*Generated:\*\*")
 _DOCUMENTS_LINE = re.compile(r"^(\s*-\s*\*\*Documents:\*\*\s*)(\S.*?)\s*$")
@@ -136,6 +143,11 @@ def _canonical_jsonl(text: str) -> str | None:
     ``generated_at`` key inside one would be detector output rather than report
     metadata, and absorbing it would hide real nondeterminism.
     """
+    # `splitlines()` then `"\n".join()` is what makes a CRLF file and an LF file
+    # compare equal, and what drops a trailing newline. Both are documented in
+    # `describe_policy` rather than fixed, because a JSON *record's* content is
+    # what this comparison is for and neither is part of it. Verified: CRLF-vs-LF
+    # and trailing-newline-vs-none both compare equal.
     lines = []
     for raw in text.splitlines():
         if not raw.strip():
@@ -156,17 +168,49 @@ def _heading_levels(lines: list[str]) -> dict[int, int]:
 
     Setext needs lookahead, so this cannot be a per-line regex: the underline
     arrives *after* the text it underlines.
+
+    Two exclusions, both because a line that looks like a heading is not one:
+
+    - A line inside a fenced code block is not a heading. A report quoting
+      `## Usage` inside a fence would otherwise close its own preamble there, and
+      `_header_end` would then miss every real section after it.
+    - A setext underline cannot follow another heading, because a heading is
+      already a complete block and a `---` on the next line is a thematic break.
+      CommonMark says exactly this. The previous version did not: `# Title` on
+      line 1 made the `---` on line 2 a level-2 heading, so `_header_end`
+      returned 1 and the report's own `**Generated:**` line was compared
+      literally -- a spurious red, since the two runs really do differ by a
+      second. The `_SETEXT_HEADING` comment above already claimed "a `---`
+      thematic break must not be mistaken for one"; this is where that is true.
+
+    `previous_was_heading` rather than "is the previous line an ATX heading",
+    because a setext heading's *last* line is its underline and that counts too.
+    Checking only ATX left `Title` / `=====` / `---` misparsed the same way.
     """
     levels: dict[int, int] = {}
+    in_fence = False
+    previous_was_heading = False
     for index, line in enumerate(lines):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            previous_was_heading = False
+            continue
+        if in_fence:
+            previous_was_heading = False
+            continue
         atx = _ATX_HEADING.match(line)
         if atx:
             levels[index] = len(atx.group(1))
+            previous_was_heading = True
             continue
-        if index and lines[index - 1].strip():
+        previous = lines[index - 1] if index else ""
+        if previous.strip() and not previous_was_heading:
             setext = _SETEXT_HEADING.match(line)
             if setext:
                 levels[index] = 1 if setext.group(1).startswith("=") else 2
+                previous_was_heading = True
+                continue
+        previous_was_heading = False
     return levels
 
 
@@ -290,12 +334,26 @@ def describe_policy() -> str:
     form and number form. Those are properties of *formatting* rather than
     results, but they are still things the comparison lets through, and the
     previous wording named three allowances while relying on several more.
+
+    The list below names two more that fall out of the same re-serialisation and
+    were previously left for a reader to discover. JSON Lines records are split
+    and rejoined with ``"\\n"``, so a CRLF file and an LF file compare equal, and
+    a file with a trailing newline and one without compare equal. Both were
+    verified. Neither is new information to the gate -- the JSON re-serialisation
+    allowance already covers whitespace, of which a line ending is a kind, and
+    the previous wording said "whitespace" too -- but a reader auditing what this
+    gate lets through should not have to derive it. The risk is bounded and
+    stated here: a `.gitattributes` change or a `core.autocrlf` setting would
+    not be detected, and neither would a report that stopped ending in a
+    newline. Neither alters the *content* of an alert record, which is what this
+    gate exists to compare.
     """
     return (
         f"Permitted variation: JSON re-serialisation (key order, whitespace, "
-        f"escape form, number form), the top-level '{REPORT_METADATA_KEY}' key "
-        f"in JSON reports, the '**Generated:**' header line in Markdown, and "
-        f"{NORMALISED_HEURISTIC} doc_ids order."
+        f"line endings, escape form, number form, trailing newline), the "
+        f"top-level '{REPORT_METADATA_KEY}' key in JSON reports, the "
+        f"'**Generated:**' header line in Markdown, and {NORMALISED_HEURISTIC} "
+        f"doc_ids order."
     )
 
 
@@ -372,6 +430,38 @@ class GitUnavailable(RuntimeError):
     """
 
 
+class GitRefused(RuntimeError):
+    """`git` ran, in a real checkout, and failed anyway.
+
+    Separate from `GitUnavailable` because it used to be invisible. `_tree_state`
+    returned None for *every* non-zero exit from `git status`, and None is the
+    documented "outside a git checkout" answer -- so a corrupt index, or git's
+    own `safe.directory` refusal on a checkout owned by another uid, produced
+    `note skipped the working-tree assertion (not a git checkout)` and exited 0.
+
+    That note was the opposite of the truth, and the assertion it described is
+    the only evidence that `toxindb demo` did not overwrite the committed
+    fixtures. Verified: the same tree-write mutation that exits 1 against a
+    healthy index exits 0 against a truncated one.
+    """
+
+
+def _inside_a_checkout(root: Path) -> bool:
+    """Is there a `.git` in `root` or any parent, the way git itself looks?
+
+    Deliberately not a message match on git's stderr. `fatal: not a git
+    repository` is one of several phrases git varies between versions and
+    locales; the presence of a `.git` entry is the property that actually
+    decides the question. It may be a *file* rather than a directory, which is
+    what a linked worktree and a submodule submodule both use, so this tests
+    `exists()` and not `is_dir()`.
+    """
+    for candidate in (root, *root.parents):
+        if (candidate / ".git").exists():
+            return True
+    return False
+
+
 def _tree_state(root: Path) -> str | None:
     """A snapshot of the working tree, including gitignored paths.
 
@@ -410,7 +500,17 @@ def _tree_state(root: Path) -> str | None:
     except FileNotFoundError as exc:
         raise GitUnavailable(str(exc)) from exc
     if proc.returncode != 0:
-        return None
+        # Distinguish "this is not a checkout" from "git is here and failed".
+        # Conflating them is how a corrupt index or a `safe.directory` refusal
+        # used to turn this assertion off and print a note asserting the
+        # opposite. Only the first is a legitimate skip, and it is decided by
+        # the absence of a `.git`, not by anything git says.
+        if not _inside_a_checkout(root):
+            return None
+        raise GitRefused(
+            f"`git status` exited {proc.returncode} in a checkout: "
+            f"{proc.stderr.strip() or proc.stdout.strip() or 'no output'}"
+        )
     # Narrow on path *components*, not on the substring `"__pycache__" in line`.
     # The substring also matched any path carrying that text anywhere in its
     # name -- `toxindb/report_cache.py`, a fixture called
@@ -519,6 +619,15 @@ def main() -> int:
             f"that the demo left the working tree alone. Install git, or delete "
             f"this job -- silently dropping the check would be worse than the "
             f"crash.",
+            file=sys.stderr,
+        )
+        return 2
+    except GitRefused as exc:
+        print(
+            f"error: {exc}. This script cannot show that the demo left the "
+            f"working tree alone, and reporting the run as deterministic without "
+            f"that evidence would be claiming more than it checked. Repair the "
+            f"checkout (`git status` in it should work) and re-run.",
             file=sys.stderr,
         )
         return 2

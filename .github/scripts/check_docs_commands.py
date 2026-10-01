@@ -464,6 +464,35 @@ class GitUnavailable(RuntimeError):
     """
 
 
+class GitRefused(RuntimeError):
+    """`git` ran, in a real checkout, and failed anyway.
+
+    `_tree_state` returned None for *every* non-zero exit from `git status`, and
+    None is the documented "outside a git checkout" answer. So a corrupt index,
+    or git's own `safe.directory` refusal on a checkout owned by another uid,
+    printed `skipped the working-tree assertion (not a git checkout)` and exited
+    0 -- a note asserting the opposite of what happened, over the one assertion
+    that shows a documented command did not rewrite the repository's fixtures.
+    Verified: `GIT_DIR=/nonexistent-dir` on an otherwise healthy checkout exits
+    0 with that note. Only the genuine "not a checkout" may be skipped.
+    """
+
+
+def _inside_a_checkout(root: Path) -> bool:
+    """Is there a `.git` in `root` or any parent, the way git itself looks?
+
+    Deliberately not a match on git's stderr text. `fatal: not a git repository`
+    is one of several phrasings that varies with git version and locale; the
+    presence of a `.git` entry is what actually decides the question. It may be a
+    *file* rather than a directory -- that is what a linked worktree and a
+    submodule both use -- so this tests `exists()`, not `is_dir()`.
+    """
+    for candidate in (root, *root.parents):
+        if (candidate / ".git").exists():
+            return True
+    return False
+
+
 def _tree_state(root: Path) -> str | None:
     """A snapshot of the tracked/untracked file list under `root`.
 
@@ -501,7 +530,17 @@ def _tree_state(root: Path) -> str | None:
     except FileNotFoundError as exc:
         raise GitUnavailable(str(exc)) from exc
     if proc.returncode != 0:
-        return None
+        # Distinguish "this is not a checkout" from "git is here and failed".
+        # Conflating them is how a corrupt index or a `safe.directory` refusal
+        # used to switch this assertion off and print a note asserting the
+        # opposite. Only the first is a legitimate skip, and it is decided by
+        # the absence of a `.git`, not by anything git says.
+        if not _inside_a_checkout(root):
+            return None
+        raise GitRefused(
+            f"`git status` exited {proc.returncode} in a checkout: "
+            f"{proc.stderr.strip() or proc.stdout.strip() or 'no output'}"
+        )
     # Byte-code caches are excluded. They come from importing the package, not
     # from a documented command, and on a fresh CI checkout they are always new
     # -- which is what made the first version of this assertion fail on
@@ -1070,6 +1109,15 @@ def main() -> int:
             f"that the documented commands left the working tree alone. Install "
             f"git, or delete this job -- silently dropping the check would be "
             f"worse than the failure.",
+            file=sys.stderr,
+        )
+        return 2
+    except GitRefused as exc:
+        print(
+            f"error: {exc}. This check cannot verify that the documented "
+            f"commands left the working tree alone, and reporting success "
+            f"without that evidence would be claiming more than it checked. "
+            f"Repair the checkout (`git status` in it should work) and re-run.",
             file=sys.stderr,
         )
         return 2

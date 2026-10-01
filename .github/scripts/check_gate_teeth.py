@@ -31,12 +31,20 @@ Four rules make this a test rather than a demonstration
    label; seven of the eleven MUST_FAIL cases go through it, and that was the
    majority of the file with no uniqueness check at all.
 
-3. **A case must fail for the stated reason.** Each MUST_FAIL case names the
-   output file whose contents must change. Without that, a case can be carried
-   entirely by one renderer while the thing it is actually about changes
-   silently -- demonstrated against an earlier version of this script, where the
-   TX-001 case still passed when the normaliser was widened to sort every
-   heuristic's doc_ids, because only the Markdown differed.
+3. **The cases that can name an output file do; the rest do not.** This rule was
+   previously written as if all eleven MUST_FAIL cases named the output file
+   whose contents must change, and as though enforcement were universal. It is
+   not: ``Case.expect`` is optional, and only two cases use it. Those two are
+   the ones where being "carried entirely by one renderer" was demonstrated
+   rather than imagined -- the TX-001 case still passed when the normaliser was
+   widened to sort every heuristic's doc_ids, because only the Markdown differed,
+   and naming ``demo_poison_alerts.jsonl`` is what turned that into a red.
+
+   The other nine assert only the exit status, which is a weaker claim than this
+   rule implies. A future case whose *subject* is a renderer-level detail should
+   name its output file; one whose subject is "the demo produced no usable
+   output" has no such file to name, because there is no output. Left stated
+   accurately rather than left as a promise the code does not keep.
 
 4. **The normalisations are proven narrow.** Each MUST_PASS case injects
    something the check is documented to absorb and requires it to stay green;
@@ -614,6 +622,49 @@ def scope_cases() -> list[tuple[str, bytes, bytes, str, bool]]:
             "a Generated line BELOW a heading is NOT absorbed",
             b"## Alerts\n\n- **Generated:** 2024\n",
             b"## Alerts\n\n- **Generated:** 2025\n",
+            ".md",
+            False,
+        ),
+        # A `---` on the line after a heading is a thematic break, not a setext
+        # H2 underline, so it must not end the preamble one line early. The
+        # previous rule matched the underline without asking what preceded it,
+        # so `# Title` / `---` made the break a heading at index 1 and left a real
+        # report's `**Generated:**` line to be compared literally -- a spurious
+        # red on a timestamp that genuinely differs between two runs.
+        (
+            "a --- break after an ATX title does not end the preamble early",
+            b"# Title\n---\n**Generated:** 2024\n\n## Summary\n\n- a: 1\n",
+            b"# Title\n---\n**Generated:** 2025\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        # Same, after a *setext* title. Checking only ATX headings would leave
+        # this one misparsed, because a setext heading's last line is its
+        # underline rather than a `#` line.
+        (
+            "a --- break after a setext title does not end the preamble early",
+            b"Title\n=====\n---\n\n**Generated:** 2024\n\n## Summary\n\n- a: 1\n",
+            b"Title\n=====\n---\n\n**Generated:** 2025\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        # A heading quoted inside a fence is part of the report body, not a
+        # section. Treating it as one closed the preamble at the fence and left
+        # every real section after it invisible.
+        (
+            "a heading inside a fence does not end the preamble",
+            b"# Title\n\n```\n## not a heading\n```\n**Generated:** 2024\n\n## Summary\n\n- a: 1\n",
+            b"# Title\n\n```\n## not a heading\n```\n**Generated:** 2025\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        # The other direction, and the reason the fix above is not a blanket
+        # relaxation: a real setext H2 in the body is still a section, so a
+        # `**Generated:**` line after it is body text and must be compared.
+        (
+            "a real setext H2 still ends the preamble",
+            b"Title\n=====\n\nIntro\n---\n\n**Generated:** 2024\n",
+            b"Title\n=====\n\nIntro\n---\n\n**Generated:** 2025\n",
             ".md",
             False,
         ),

@@ -510,10 +510,21 @@ def main() -> int:
         for problem in problems:
             print(f"  - {problem}")
         return 1
+    # Counted, not assumed. The previous version printed
+    # `len(MUST_FAIL) + len(STRUCTURAL)` under the words "rejected", which
+    # overstated the result by 17%: four of the STRUCTURAL cases expect exit 0,
+    # because the gate is *supposed* to accept those documents. They are real
+    # cases and worth running -- a rule that rejects a well-formed document is
+    # just as broken as one that misses a defect -- but calling them "rejected"
+    # claims evidence that does not exist, in the one line a reader is most
+    # likely to quote when auditing what this gate proved.
+    rejected = sum(1 for case in (*MUST_FAIL, *STRUCTURAL) if case.expect_rc != 0)
+    accepted_defects = len(MUST_FAIL) + len(STRUCTURAL) - rejected
     print(
-        f"The docs gate rejected {len(MUST_FAIL) + len(STRUCTURAL)} injected "
-        f"document defects, accepted {len(MUST_PASS)} good README(s), executed "
-        f"no command substitution, and did not confuse a crash with a verdict."
+        f"The docs gate rejected {rejected} injected document defects, "
+        f"correctly accepted {accepted_defects} well-formed document(s) it must "
+        f"not reject, accepted {len(MUST_PASS)} good README(s), executed no "
+        f"command substitution, and did not confuse a crash with a verdict."
     )
     return 0
 

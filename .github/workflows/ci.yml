@@ -167,7 +167,9 @@ jobs:
         run: python .github/scripts/check_demo_determinism.py "${RUNNER_TEMP}/det"
       - name: Prove the determinism gate can actually fail
         # A gate nobody has watched reject bad input is not a gate. This
-        # injects ten kinds of nondeterminism into throwaway copies of the tree
+        # injects eleven kinds of nondeterminism into throwaway copies of the
+        # tree. (The script prints the authoritative count on its last line; a
+        # copy in this comment said "ten" and drifted when a case was added.)
         # and asserts the check above reports each as a real difference rather
         # than merely exiting non-zero, then injects the one case it is
         # *meant* to absorb and asserts it stays green, then asserts a
@@ -190,12 +192,14 @@ jobs:
         # alias of every import node, so the formatting of the source stops
         # mattering.
         #
-        # `--self-test` runs in the same step, not in a separate one, because a
-        # separate script is one more thing that can quietly stop running. It
-        # proves the scanner rejects the shapes above and accepts lookalikes
-        # (`socket_helpers`, `sockets`, a path in a string) before the real
-        # scan, so a scanner that rejected everything could not pass.
-        run: python .github/scripts/check_no_network.py --self-test toxindb
+        # The scanner checks itself before scanning, in the same step and in the
+        # same file, because a separate script is one more thing that can
+        # quietly stop running. It proves the scanner rejects the shapes above
+        # and accepts lookalikes (`socket_helpers`, `sockets`, a path in a
+        # string), so a scanner that rejected everything could not pass. There is
+        # no flag for it: it runs on every invocation, including this one, which
+        # is why there is nothing to pass beyond the directory.
+        run: python .github/scripts/check_no_network.py toxindb
 
   # Guards the packaging metadata itself, independent of the source tree.
   build:
