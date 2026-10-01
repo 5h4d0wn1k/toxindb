@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import List, Optional
@@ -103,11 +104,18 @@ def _plant_timestamp(trace: Trace) -> float:
     This used to be hardcoded to `999999.0` (1970-01-12). Every recency window
     in the tool is measured as `event.timestamp - doc.timestamp`, so on any
     trace carrying real epoch timestamps the planted document sat outside every
-    window by decades: TX-001 counted 0 of the retrieved canary docs as recent
-    and TX-004 never fired. Verified on a trace at 1.75e9 -- the plant was 55.4
-    years old and produced 0 canary alerts out of 9. Since `--plant` is the
-    documented way to prove detection works, a plant that cannot be detected
-    defeats the command's entire purpose.
+    window by decades: a query retrieving it counted 0 of its documents as
+    recent and so raised no TX-001. Verified on a trace at 1.75e9 -- the plant
+    was 55.4 years older than the trace it joined. Since `--plant` is the
+    documented way to prove detection works, a plant that no demand-and-recency
+    detector can see defeats the command's entire purpose.
+
+    TX-004 is deliberately *not* named above. It substring-matches canary text
+    in `query.output_text` and does no timestamp arithmetic at all, so it fires
+    on a 1970-stamped plant exactly as it would on any other. An earlier
+    version of this docstring said it "never fired", which was wrong: the
+    timestamp defect was never about resurgence, only about the TX-001/TX-002
+    family.
 
     The latest timestamp already in the trace, rather than wall-clock, for
     three reasons. It keeps the tool deterministic, which is a hard invariant
@@ -116,12 +124,24 @@ def _plant_timestamp(trace: Trace) -> float:
     cannot land in the future relative to the queries that would retrieve it,
     which several windows would read as a negative age.
 
+    Timestamps that are not finite numbers are skipped rather than compared.
+    `Trace.from_jsonl` performs no validation, so a record carrying
+    `"timestamp": null` reaches here intact, and `max()` over it raised an
+    uncaught `TypeError` -- turning a malformed trace into a traceback on a
+    command that previously succeeded. Skipping means a trace with one bad
+    timestamp plants at the best of its good ones instead of crashing, and a
+    trace with no usable timestamp falls back rather than guessing.
+
     Falls back to `999999.0` for an empty trace, so the old constant survives
     only where it is the only answer available. `trace_gen` bases its fixtures
     near `1_000_000.0`, which is why the hardcoded value looked plausible: the
     bundled demo hid the defect rather than disproving it.
     """
-    stamps = [e.timestamp for e in (*trace.ingests, *trace.queries)]
+    stamps = [
+        e.timestamp
+        for e in (*trace.ingests, *trace.queries)
+        if isinstance(e.timestamp, (int, float)) and math.isfinite(e.timestamp)
+    ]
     return max(stamps) if stamps else 999999.0
 
 
@@ -141,6 +161,29 @@ def _plant_output_path(trace_path: str) -> str:
     """
     base, _ext = os.path.splitext(trace_path)
     return f"{base}_canary_planted.jsonl"
+
+
+def _same_file(left: str, right: str) -> bool:
+    """Whether two paths name the same file, following links.
+
+    Not `abspath` equality. That compares *names*, and an output path already
+    present as a symlink or hardlink to the input has a different name while
+    being the same file -- so the string test passed and `open(out, "w")`
+    clobbered the input with exit 0. Verified with a symlink named exactly as
+    the computed output.
+
+    `os.path.samefile` is the correct test but it raises if either path is
+    missing, which is the normal case here: the output is a file about to be
+    created. So the plain paths are compared first as a cheap answer, and the
+    inode comparison is only attempted for a path that exists.
+    """
+    if os.path.abspath(left) == os.path.abspath(right):
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        # Neither present, or unreadable: they cannot be the same file.
+        return False
 
 
 def cmd_canary(args) -> int:
@@ -164,16 +207,35 @@ def cmd_canary(args) -> int:
         canary = generate_canary(args.seed)
         requested = getattr(args, "at", None)
         if requested is not None:
+            if not math.isfinite(requested):
+                # `type=float` accepts `nan`, `inf` and `1e400`, and `json.dumps`
+                # writes those as the bare tokens `NaN` and `Infinity`, which
+                # RFC 8259 does not allow. Python's own `json.loads` accepts
+                # them, so toxindb round-trips its own output and never notices
+                # -- the break lands on every external consumer of a planted
+                # trace, and the exit code is 0. Refused rather than sanitised,
+                # because silently planting a timestamp the operator did not ask
+                # for is worse than declining to plant.
+                print(
+                    f"Error: --at must be a finite number, got {requested!r}.",
+                    file=sys.stderr,
+                )
+                return 1
             timestamp = requested
         else:
             timestamp = _plant_timestamp(trace)
         plant_canary_in_trace(trace, canary, timestamp=timestamp)
         out_path = _plant_output_path(trace_path)
-        if os.path.abspath(out_path) == os.path.abspath(trace_path):
-            # Unreachable via `_plant_output_path` as written, and kept as a
-            # standing guard rather than an assumption. Overwriting the input
-            # is the one failure here that destroys data rather than reporting
-            # it, and this is the line that would do it.
+        if _same_file(out_path, trace_path):
+            # A standing guard on the one failure here that destroys data rather
+            # than reporting it.
+            #
+            # The path-equality half is unreachable via `_plant_output_path` as
+            # written -- it always appends a suffix -- and brute-forcing 22,629
+            # generated path shapes found no input for which the output equals
+            # the input. Kept because it costs one string comparison and the
+            # failure it guards is irreversible. The inode half is *not*
+            # unreachable: see `_same_file`.
             print("Error: refusing to overwrite the input trace.", file=sys.stderr)
             return 1
         trace.to_jsonl(out_path)
