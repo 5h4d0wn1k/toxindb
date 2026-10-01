@@ -178,16 +178,24 @@ jobs:
         # a mutation that merely broke the demo would score as a pass.
         run: python .github/scripts/check_gate_teeth.py
       - name: Assert the core makes no network calls
-        # SCOPE.md and the README both promise "zero network calls". This is
-        # the one place that promise could silently be broken by a future
+        # SCOPE.md and the README both promise "zero network calls". This is the
+        # one place that promise could silently be broken by a future
         # dependency, so it is checked rather than trusted.
-        run: |
-          set -euo pipefail
-          if grep -rnE '^\s*(import|from)\s+(socket|ssl|http|urllib|requests|ftplib|smtplib|telnetlib|asyncio)\b' toxindb/ ; then
-            echo "::error::the stdlib-only, offline core must not import network modules"
-            exit 1
-          fi
-          echo "no network imports in toxindb/"
+        #
+        # This used to be a `grep -E` anchored at the start of an import
+        # statement, which required the network module to be the first name on
+        # the line. `import os, socket`, `import json, urllib.request` and a
+        # parenthesised `from x import (\n    ssl,\n)` all passed it -- verified,
+        # exit 0 over a module that imports socket. An `ast` walk collects every
+        # alias of every import node, so the formatting of the source stops
+        # mattering.
+        #
+        # `--self-test` runs in the same step, not in a separate one, because a
+        # separate script is one more thing that can quietly stop running. It
+        # proves the scanner rejects the shapes above and accepts lookalikes
+        # (`socket_helpers`, `sockets`, a path in a string) before the real
+        # scan, so a scanner that rejected everything could not pass.
+        run: python .github/scripts/check_no_network.py --self-test toxindb
 
   # Guards the packaging metadata itself, independent of the source tree.
   build:

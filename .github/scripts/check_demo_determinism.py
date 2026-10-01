@@ -191,6 +191,17 @@ def _header_end(lines: list[str], levels: dict[int, int]) -> int:
     timestamp was never normalised in the reports the gate actually compares,
     and the gate passed only because two consecutive runs usually land in the
     same second -- a spurious failure roughly one run in ten.
+
+    When there is no section heading at all -- the document's only heading is
+    its title, or it has no headings -- there is no preamble and the index is 0.
+    Returning ``len(lines)`` instead, as this used to, made the whole document
+    its own header, so a ``**Generated:**`` line anywhere in the body was
+    absorbed. For a report that means a per-run timestamp silently normalised
+    away: a gate that reports two differing runs as identical is the one
+    failure mode a determinism check must not have. None of this project's
+    reports are shaped that way -- each has a ``## Summary`` -- so the stricter
+    rule costs nothing and errs towards reporting a difference rather than
+    hiding one.
     """
     ordered = sorted(levels)
     if ordered:
@@ -199,7 +210,7 @@ def _header_end(lines: list[str], levels: dict[int, int]) -> int:
             line.strip() for line in lines[: _span_start(lines, first)]
         ):
             ordered = ordered[1:]
-    return ordered[0] if ordered else len(lines)
+    return ordered[0] if ordered else 0
 
 
 def _canonical_markdown(text: str) -> str:
@@ -400,11 +411,27 @@ def _tree_state(root: Path) -> str | None:
         raise GitUnavailable(str(exc)) from exc
     if proc.returncode != 0:
         return None
+    # Narrow on path *components*, not on the substring `"__pycache__" in line`.
+    # The substring also matched any path carrying that text anywhere in its
+    # name -- `toxindb/report_cache.py`, a fixture called
+    # `__pycache__notes.jsonl` -- and dropped it from the comparison without
+    # saying so, which is the failure this assertion exists to produce. See the
+    # same filter in check_docs_commands.py.
     return "".join(
-        line
-        for line in proc.stdout.splitlines(keepends=True)
-        if "__pycache__" not in line and not line.rstrip().endswith(".pyc")
+        line for line in proc.stdout.splitlines(keepends=True)
+        if not _is_byte_code_cache(line)
     )
+
+
+def _is_byte_code_cache(line: str) -> bool:
+    """Is this `git status --porcelain` line a byte-code cache entry?
+
+    `XY PATH`, so the path starts at offset 3. A rename reads `old -> new` and
+    the new name is the one on disk.
+    """
+    entry = line[3:] if len(line) > 3 else ""
+    path = entry.split(" -> ")[-1].strip().strip('"')
+    return "__pycache__" in path.split("/") or path.endswith(".pyc")
 
 
 def _assert_tree_unchanged(before: str | None, after: str | None, root: Path) -> int:

@@ -13,14 +13,31 @@ holes found by inspection rather than by a failing test:
   nothing about the substitution was inspected.
 * a fence that was never closed printed ``::error::`` and still exited 0, so
   every command after it silently went uncompared.
-* ``RUNNABLE_STEPS`` was anchored at the start of the string, so
+* the runnable-command patterns were anchored at the start of the string, so
   ``env toxindb ...``, ``nohup toxindb ...``, ``timeout 5 toxindb ...`` and
   ``FOO=bar toxindb ...`` were all reported as "not a toxindb command" and
   skipped. The job exited 0 with two nonexistent subcommands unverified.
 
-Each of those is a MUST_FAIL case here, and each one is a *regression* test: a
-future change that reintroduces ``shell=True`` turns the substitution case green
-again in exactly the way it was before.
+Each of those is a MUST_FAIL case here. One claim about them was wrong, and the
+correction matters more than the fix did.
+
+This docstring used to say each case was a *regression* test, and that "a future
+change that reintroduces ``shell=True`` turns the substitution case green again
+in exactly the way it was before." It does not. Verified: restoring
+``shell=True`` with a joined string leaves every case green but one. All of the
+rest is carried by ``shell_syntax_reason``, which refuses the metacharacter
+before ``subprocess.run`` is ever reached; deleting only that guard turns seven
+cases red while ``shell=False`` itself is asserted by nothing. A docstring that
+tells a reviewer a hole is closed when no test covers it is worse than the hole,
+because the reader stops looking.
+
+So ``shell=False`` now has its own case, and it works by finding the one shape
+the syntax guard cannot cover. The guard sees the raw command text, where a
+*quoted* metacharacter is an ordinary argument; ``shlex`` then strips the quotes
+and the argv vector holds a bare ``&``. A shell would treat that as an operator.
+``toxindb monitor '&'`` exits 1 with argv execution and 0 with
+``shell=True`` plus a joined string, because the second backgrounds the command
+and reports the shell's status -- the original defect, one token further along.
 
 Two rules, same as the determinism gate's:
 
@@ -59,7 +76,6 @@ VERDICT_MARKERS = (
     "SKIP  ",
     "error:",
     "::error::",
-    "Traceback",
 )
 
 
@@ -77,6 +93,23 @@ def readme(body: str) -> str:
 # assumed, because a wrong expectation here reads as a gate failure and costs
 # more time than the constant is worth.
 COMMAND_LINE = 4
+
+# Line numbers for the multi-block documents below, and the gate's own
+# `f"{line_no:<5}"` padding reproduced literally -- `README.md:14` is followed by
+# four spaces, `README.md:8` by five. Spelled out rather than computed, because a
+# computed expectation that is wrong moves with the document and can never be
+# wrong in an obvious way. Both were counted by hand from the markdown in the
+# case and then confirmed against the gate's output, which is how the padding was
+# found: three of these cases failed on it the first time.
+#
+# The hidden-block document, numbered:
+#     1 # Synthetic   2 (blank)   3 Prose.   4 (blank)   5 ```bash
+#     6 toxindb --version          7 ```      8 (blank)  9 (blank)
+#    10 ```python  11 x = 1  12 (blank)     13 ```bash
+#    14 toxindb nosuchsubcommand   15 ```
+HIDDEN_FENCE_LINE = 10        # the ```python that is never closed
+HIDDEN_COMMAND_LINE = 14       # the command it was hiding
+QUOTED_COMMAND_LINE = 8        # the first command inside `> ```bash`
 
 # An absolute path outside the gate's own scratch directory, used to detect
 # whether a documented command substitution actually ran.
@@ -130,6 +163,22 @@ MUST_FAIL = [
         readme("toxindb nosuchsubcommand &"),
         1,
         expect="background operator",
+    ),
+    # The ONLY case that pins `shell=False`. Every other metacharacter case is
+    # carried by the syntax guard, so with `shell=True` restored they all stay
+    # green -- which is what the module docstring used to (wrongly) claim they
+    # would catch. This one cannot be carried by the guard: `&` is quoted, so the
+    # guard sees an ordinary argument, and it is `shlex` that then strips the
+    # quotes and leaves a bare `&` in the argv vector. A shell reintroduced at
+    # the subprocess call reads that as the background operator, backgrounds the
+    # command, and reports 0 -- so the gate prints PASS for a documented command
+    # that never ran. Verified in both directions: rc=1 with argv execution,
+    # rc=0 with `shell=True` and `" ".join(argv)`.
+    Case(
+        "a quoted operator is an argument, and argv execution says so",
+        readme("toxindb monitor '&'"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
     ),
     # Finding: `$(...)` reached /bin/sh and ran. The gate used to execute it,
     # which breaks its own "no network" promise: nothing inspects the inside of
@@ -267,6 +316,71 @@ STRUCTURAL = [
         "a tilde-fenced non-shell block is consumed, not read as unlabelled",
         "# Synthetic\n\n~~~python\nprint(1)\n~~~\n\n```bash\ntoxindb --version\n```\n",
         0,
+    ),
+    # An unterminated non-shell fence used to swallow every ```bash block after
+    # it, because the `bash` line was accepted as its closer. Nothing was
+    # printed, nothing was skipped, and the job was green with a documented
+    # `nosuchsubcommand` unverified -- the exact shape of hole this script
+    # exists to close. Two assertions, because the two halves fail separately:
+    # the structural error names the *python* fence, and the command inside the
+    # block the python fence was hiding is actually run and reported.
+    Case(
+        "an unterminated non-shell fence does not hide a later bash block",
+        "# Synthetic\n\nProse.\n\n```bash\ntoxindb --version\n```\n\n\n"
+        "```python\nx = 1\n\n```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect=f"FAIL  README.md:{HIDDEN_COMMAND_LINE}    toxindb nosuchsubcommand",
+    ),
+    Case(
+        "that hidden block is also reported as an unclosed fence",
+        "# Synthetic\n\nProse.\n\n```bash\ntoxindb --version\n```\n\n\n"
+        "```python\nx = 1\n\n```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect=(
+            f"::error::{HIDDEN_FENCE_LINE}: non-shell code fence "
+            f"opened here is never closed"
+        ),
+    ),
+    # `||` runs its right-hand side precisely because the left-hand side failed,
+    # so the line succeeds. Treating it as `&&` reported a correct documented
+    # command as broken, which is how a maintainer learns to ignore a red job.
+    Case(
+        "a || chain succeeds when the second command succeeds",
+        readme("toxindb nosuchsubcommand || toxindb --version"),
+        0,
+        expect=f"PASS  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "a || chain fails when both commands fail",
+        readme("toxindb nosuchsubcommand || toxindb alsonosuchsubcommand"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "a && chain still stops at the first failure",
+        readme("toxindb nosuchsubcommand && toxindb --version"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    # A fenced block inside a block quote is a block a reader will copy. The
+    # fence pattern was anchored at column 0, so `> ```bash` never matched and
+    # the block was invisible -- with no skip reason, and with the
+    # "no documented command was executed" floor satisfied by whatever other
+    # block the document had.
+    Case(
+        "a block-quoted bash fence is executed",
+        "# Synthetic\n\n```bash\ntoxindb --version\n```\n\n"
+        "> ```bash\n> toxindb nosuchsubcommand\n> ```\n",
+        1,
+        expect=f"FAIL  README.md:{QUOTED_COMMAND_LINE}     toxindb nosuchsubcommand",
+    ),
+    # The mirror image: an *unquoted* `#` inside a filename is a legal token in a
+    # shell too, and refusing it silently cost a real command its check.
+    Case(
+        "a hash inside a filename is not a comment",
+        readme("toxindb monitor 'examples/traces/poison_trace.jsonl' --output r#1/"),
+        0,
+        expect=f"PASS  README.md:{COMMAND_LINE}",
     ),
 ]
 
