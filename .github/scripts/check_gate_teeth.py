@@ -52,9 +52,17 @@ for doing that has a failure mode:
 
 So the *scope* of the doc_ids normalisation is verified directly, by calling
 ``canonical_bytes()`` on two records that differ only in that order. That is
-exact, instant, and cannot flake. End-to-end evidence that varying doc order in
-a *non*-normalised detector is caught comes from the TX-001 case, which has
-three elements in the poison fixture and is therefore reliable.
+exact, instant, and cannot flake.
+
+End-to-end evidence that varying doc order in a *non*-normalised detector is
+caught comes from the TX-001 case, whose overlap holds three or four ids in the
+poison fixture. That case used to be reliable by luck: it drew a fresh random
+ordering per call, and if all 13 draws happened to match between the two runs
+the check correctly reported that it could not see the difference, which counted
+as a failure of this script. At 1/2 per draw that was 0.0122% per run, and
+0.46% for the appendix case, measured at 5 misses in 1000 runs. Both now derive
+their ordering from ``TOXINDB_DETERMINISM_RUN``, which the determinism check
+exports for exactly this purpose, so the runs are guaranteed to differ.
 """
 
 from __future__ import annotations
@@ -95,21 +103,42 @@ IGNORE = shutil.ignore_patterns(
 )
 
 # Substrings the check prints only when it performed a real comparison and
-# found a difference, as opposed to the demo failing to run.
+# found a difference, as opposed to the demo failing to run. The last one is
+# the "compared nothing" guard: a demo that writes only empty or only
+# unparseable files has produced no result, and saying so is a real verdict.
 DIFF_MARKERS = (
     "differs between runs",
     "was produced by run",
     "no output files in common",
-    "every compared file was empty",
+    "no compared file was non-empty and machine-readable",
 )
 
-# A random ordering, injected in place of a detector's doc_ids. Both branches
-# hold the same ids in opposite orders, so the content is unaffected and only
-# the ordering varies -- and it varies *per call*, which is what makes the
-# check's two runs disagree.
-RANDOM_ORDER = (
-    "(list(reversed({var})) if __import__('random').random() < 0.5 "
-    "else list({var}))"
+# A per-run ordering, injected in place of a detector's doc_ids. The second run
+# gets the ids rotated by one; the first gets them as they are. Same multiset,
+# different order, and the difference is guaranteed rather than probable.
+#
+# This used to be a coin flip per call, which is a real defect: the end-to-end
+# cases can only fail if the two runs *actually* disagree, so a mutation that
+# rolls `random()` has a chance of producing identical output and the gate then
+# correctly reports that the check is blind -- which is itself a failure. For
+# TX-001 that chance was 0.0122% per run (13 draws, 1/2 each), and for the
+# appendix 0.46% (3 draws from 6 orders), measured at 5 misses in 1000 runs. A
+# gate that fails intermittently for its own reasons is a gate nobody trusts, so
+# the ordering is derived from `TOXINDB_DETERMINISM_RUN` instead: the
+# determinism check exports which run it is, and the difference is then
+# certain instead of merely likely.
+RUN_INDEXED_ORDER = (
+    "(list({var})[1:] + list({var})[:1]"
+    " if __import__('os').environ.get('TOXINDB_DETERMINISM_RUN') == '2'"
+    " else list({var}))"
+)
+
+# The same trick for a run-varying literal in a Markdown appendix. Run 1 emits
+# one order, run 2 the reverse.
+RUN_INDEXED_IDS = (
+    "['zz-9', 'zz-8', 'zz-7']"
+    " if __import__('os').environ.get('TOXINDB_DETERMINISM_RUN') != '2'"
+    " else ['zz-7', 'zz-8', 'zz-9']"
 )
 
 
@@ -187,13 +216,16 @@ def m_random_value_in_alert_detail(repo: Path) -> None:
 
 
 def m_random_tx001_doc_order(repo: Path) -> None:
-    """TX-001 emits its doc_ids in a random order.
+    """TX-001 emits its doc_ids in a different order on each run.
 
     The mirror image of the TX-008 normalisation, and it must be CAUGHT.
     Sorting every detector's doc_ids would hide any future ordering bug in any
     heuristic, so the normalisation is scoped to TX-008 and this proves it.
-    TX-001's overlap holds three ids in the poison fixture, so the order really
-    does differ between runs rather than coinciding half the time.
+
+    The order is a rotation keyed on the run index rather than a coin flip, so
+    the two runs are guaranteed to disagree; see `RUN_INDEXED_ORDER`. Rotating is
+    only a change when the overlap holds two or more distinct ids, and TX-001's
+    does -- the alerts in the poison fixture carry three and four.
 
     The anchor `doc_ids=recent_docs,` also appears in TX-002, so the
     replacement is scoped to the class and asserted unique within it.
@@ -202,7 +234,7 @@ def m_random_tx001_doc_order(repo: Path) -> None:
         repo.joinpath(*_HEURISTICS),
         "DemandConcentrationDetector",
         "doc_ids=recent_docs,",
-        f"doc_ids={RANDOM_ORDER.format(var='recent_docs')},",
+        f"doc_ids={RUN_INDEXED_ORDER.format(var='recent_docs')},",
     )
 
 
@@ -255,11 +287,14 @@ def m_generated_line_after_a_heading(repo: Path) -> None:
 
 
 def m_appendix_after_tx008(repo: Path) -> None:
-    """Random document ordering in a section that merely *follows* TX-008.
+    """Run-varying document ordering in a section that *follows* TX-008.
 
     The Markdown normalisation is scoped to the `### TX-008` section and any
     heading closes it. Without that, `section` latches onto TX-008 for the rest
     of the document and every later `**Documents:**` line gets silently sorted.
+
+    The ordering is keyed on the run index, not drawn with `random.sample`, so
+    the two runs are guaranteed to disagree; see `RUN_INDEXED_IDS`.
     """
     _replace(
         repo / "toxindb" / "report.py",
@@ -267,7 +302,7 @@ def m_appendix_after_tx008(repo: Path) -> None:
         "lines.append(\"\")\n"
         "    lines.append(\"## Appendix\")\n"
         "    lines.append(\"- **Documents:** `\" + "
-        "','.join(__import__('random').sample(['zz-9','zz-8','zz-7'], 3)) + \"`\")\n"
+        f"','.join({RUN_INDEXED_IDS}) + \"`\")\n"
         "    return \"\\n\".join(lines)",
     )
 
@@ -320,6 +355,10 @@ def m_demo_writes_only_empty_files(repo: Path) -> None:
     empty files compare equal. Mutated at the point where the output directory
     is created, so the demo still exits 0 -- the rest of the body becomes
     unreachable rather than undefined.
+
+    The guard for this is the same one that catches
+    ``m_demo_writes_only_unparseable_reports``; the two cases are here because a
+    guard that only handles one of them is a guard that will be re-broken.
     """
     cli = repo / "toxindb" / "cli.py"
     _replace(
@@ -331,6 +370,32 @@ def m_demo_writes_only_empty_files(repo: Path) -> None:
         "    output_dir = args.output\n"
         "    os.makedirs(output_dir, exist_ok=True)\n"
         "    open(os.path.join(output_dir, 'teeth-empty.txt'), 'w').close()\n"
+        "    return 0\n"
+        "\n"
+        "    results = {}\n",
+    )
+
+
+def m_demo_writes_only_unparseable_reports(repo: Path) -> None:
+    """The demo writes one report per run, and it is never valid JSON.
+
+    The second shape of the zero-*content* case, and the one the guard used to
+    miss. Two empty files are caught by a count of empty files, but
+    ``{not json`` is neither empty nor parseable, so a guard that only counts
+    zero-byte files reported this run as deterministic -- on output that proves
+    nothing at all. The file is non-empty and identical on every run, so every
+    earlier check passed it.
+    """
+    _replace(
+        repo / "toxindb" / "cli.py",
+        "    output_dir = args.output\n"
+        "    os.makedirs(output_dir, exist_ok=True)\n"
+        "\n"
+        "    results = {}\n",
+        "    output_dir = args.output\n"
+        "    os.makedirs(output_dir, exist_ok=True)\n"
+        "    with open(os.path.join(output_dir, 'teeth-broken.json'), 'w') as _fh:\n"
+        "        _fh.write('{not json')\n"
         "    return 0\n"
         "\n"
         "    results = {}\n",
@@ -359,11 +424,17 @@ def m_volatile_suffix_on_documents_line(repo: Path) -> None:
 def m_microsecond_report_timestamp(repo: Path) -> None:
     """Report metadata raised to microsecond resolution.
 
-    The shipped ``generated_at`` has second granularity, so two runs inside one
-    second would be byte-identical anyway and the timestamp normalisation could
-    pass *vacuously*. Raising it to microseconds makes the value vary on every
-    single run, which proves the normalisation is load-bearing rather than
-    decorative.
+    The JSON report's ``generated_at`` is built with ``datetime.isoformat()``,
+    which carries microseconds, so the two runs the check makes already differ
+    here and the timestamp normalisation is load-bearing rather than
+    decorative. The Markdown ``**Generated:**`` line is the opposite: it is
+    formatted with ``%Y-%m-%dT%H:%M:%SZ``, so it has second granularity and two
+    runs inside one second are byte-identical anyway.
+
+    This mutation raises the *JSON* value's explicit format to microseconds as
+    well, so the case is not resting on the default. An earlier version of this
+    docstring claimed it removed that dependence; it did not, because the
+    default already had microseconds.
     """
     _replace(
         repo / "toxindb" / "report.py",
@@ -409,6 +480,10 @@ def _j(obj) -> bytes:
 # detection result and must be compared. Parameterising the list matters: a
 # single hard-coded probe name leaves the teeth gate fully green when the
 # allowlist is quietly widened, which is the exact failure the case exists for.
+#
+# These eight all exercise the *same* code path -- one extra top-level JSON key
+# compared by name. They are eight data points, not eight mechanisms, and the
+# summary line below says so rather than implying otherwise.
 VOLATILE_LOOKING_NAMES = (
     "timestamp",
     "created_at",
@@ -657,17 +732,24 @@ MUST_FAIL = [
         "demo_poison_alerts.jsonl differs",
     ),
     Case(
-        "TX-001 doc_ids in random order (not the known #22 defect)",
+        "TX-001 doc_ids in a different order on each run (not the known #22 defect)",
         m_random_tx001_doc_order,
         "demo_poison_alerts.jsonl differs",
     ),
     Case("new volatile field in the JSON report", m_new_volatile_report_field),
     Case("generated_at grown by a detector", m_generated_at_inside_an_alert),
     Case("a Generated line emitted below the report header", m_generated_line_after_a_heading),
-    Case("volatile document ordering after the TX-008 section", m_appendix_after_tx008),
+    Case(
+        "volatile document ordering after the TX-008 section",
+        m_appendix_after_tx008,
+    ),
     Case("extra output file on one run only", m_extra_output_file),
     Case("demo exits 0 but writes no files", m_demo_writes_nothing),
     Case("demo writes only an empty file", m_demo_writes_only_empty_files),
+    Case(
+        "demo writes only an unparseable report",
+        m_demo_writes_only_unparseable_reports,
+    ),
     Case("volatile text on a Markdown Documents line", m_volatile_suffix_on_documents_line),
 ]
 
@@ -775,7 +857,12 @@ def main() -> int:
         else:
             print(f"  ok     {case.title} -> rc={rc}, reported as a failure to run")
 
-    print(f"\nNormalisation scope -- {len(scope_cases())} properties, called directly:")
+    print(
+        f"\nNormalisation scope -- {len(scope_cases())} properties, called "
+        f"directly. {len(VOLATILE_LOOKING_NAMES)} of them are the same "
+        f"volatile-key probe with different names, so this is fewer distinct "
+        f"mechanisms than the count suggests:"
+    )
     problems.extend(check_normaliser_scope())
 
     for path in created:
@@ -790,8 +877,10 @@ def main() -> int:
     print(
         f"The check rejected {len(MUST_FAIL)} injected defects as real differences, "
         f"absorbed {len(MUST_PASS)} documented normalisation end to end, verified "
-        f"{len(scope_cases())} normaliser scope properties directly, and did not "
-        "confuse a crash with a detection."
+        f"{len(scope_cases())} normaliser scope properties directly "
+        f"({len(scope_cases()) - len(VOLATILE_LOOKING_NAMES)} distinct, plus "
+        f"{len(VOLATILE_LOOKING_NAMES)} names through one code path), and did "
+        "not confuse a crash with a detection."
     )
     return 0
 

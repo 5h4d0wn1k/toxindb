@@ -26,10 +26,12 @@ Two things, both scoped as narrowly as the code allows:
 
 1. **Report metadata, and only report metadata.** The ``generated_at`` key is
    removed from the *top level* of a JSON report, and the ``**Generated:**``
-   line is removed from the *header* of a Markdown report -- that is, only
-   before the first heading. Both record when a report was written, and nothing
-   else in this codebase produces either: ``generated_at`` appears exactly once
-   in the whole package, at ``report.py:100``.
+   line is removed from the *preamble* of a Markdown report -- the lines before
+   the first section heading. A leading ``# title`` is a title rather than a
+   section and does not end the preamble, because this project's own reports are
+   shaped that way. Both record when a report was written, and nothing else in
+   this codebase produces either: ``generated_at`` appears exactly once in the
+   whole package, at ``report.py:100``.
 
    The scoping is the point. An earlier version removed the key at any depth
    and dropped any line containing the marker, which meant a detector that grew
@@ -57,6 +59,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -70,8 +73,17 @@ REPORT_METADATA_KEY = "generated_at"
 NORMALISED_HEURISTIC = "TX-008"
 
 _BACKTICKED = re.compile(r"`([^`]*)`")
-_ANY_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
-_TX_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(TX-\d+)")
+# ATX headings, with or without a space after the hashes: CommonMark accepts
+# `#Heading` as well as `# Heading`. `(?!#)` is what stops seven hashes from
+# being read as a six-hash heading. Recognising only the spaced form left the
+# TX-008 section open for the other spelling.
+_ATX_HEADING = re.compile(r"^\s{0,3}(#{1,6})(?!#)")
+# Setext underlines, where `=====` underlines an H1 and `-----` an H2. A setext
+# heading is only a heading when the line above it is non-blank, so this is
+# resolved with lookahead in `_heading_levels` rather than by matching a line in
+# isolation -- a `---` thematic break must not be mistaken for one.
+_SETEXT_HEADING = re.compile(r"^\s{0,3}(=+|-{2,})\s*$")
+_TX_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*(TX-\d+)")
 _GENERATED_LINE = re.compile(r"^\s*(?:[-*+]\s+)?\*\*Generated:\*\*")
 _DOCUMENTS_LINE = re.compile(r"^(\s*-\s*\*\*Documents:\*\*\s*)(\S.*?)\s*$")
 # A Documents tail that is *nothing but* a comma-separated list of doc ids.
@@ -139,18 +151,70 @@ def _canonical_jsonl(text: str) -> str | None:
     return "\n".join(lines)
 
 
-def _canonical_markdown(text: str) -> str:
-    out = []
-    in_header = True
-    section = None
-    for line in text.splitlines(keepends=True):
-        if in_header and _GENERATED_LINE.match(line):
+def _heading_levels(lines: list[str]) -> dict[int, int]:
+    """Map line index -> heading level, for ATX and setext headings.
+
+    Setext needs lookahead, so this cannot be a per-line regex: the underline
+    arrives *after* the text it underlines.
+    """
+    levels: dict[int, int] = {}
+    for index, line in enumerate(lines):
+        atx = _ATX_HEADING.match(line)
+        if atx:
+            levels[index] = len(atx.group(1))
             continue
-        # Any heading at any level ends the header and closes the current
-        # section. Matching only `### TX-\d+` would leave `section` latched onto
-        # TX-008 for the rest of the document.
-        if _ANY_HEADING.match(line):
-            in_header = False
+        if index and lines[index - 1].strip():
+            setext = _SETEXT_HEADING.match(line)
+            if setext:
+                levels[index] = 1 if setext.group(1).startswith("=") else 2
+    return levels
+
+
+def _span_start(lines: list[str], index: int) -> int:
+    """First line of the heading block whose marker is at `index`.
+
+    A setext heading is underlined, so its text is on the line *above* the
+    marker; an ATX heading is a single line. Needed so that a setext H1 title is
+    recognised as a title rather than as a section.
+    """
+    return index - 1 if _SETEXT_HEADING.match(lines[index]) else index
+
+
+def _header_end(lines: list[str], levels: dict[int, int]) -> int:
+    """Index of the first line that ends a report's metadata preamble.
+
+    A level-1 heading at the very top is the document *title*, not a section,
+    so it does not end the preamble; the block ends at the next heading. This
+    is the fix for a real defect: the previous rule ended the header at the
+    first heading of any level, and this project's own reports start with
+    ``# <title>`` on line 1 and put ``**Generated:**`` on line 3. So the
+    timestamp was never normalised in the reports the gate actually compares,
+    and the gate passed only because two consecutive runs usually land in the
+    same second -- a spurious failure roughly one run in ten.
+    """
+    ordered = sorted(levels)
+    if ordered:
+        first = ordered[0]
+        if levels[first] == 1 and not any(
+            line.strip() for line in lines[: _span_start(lines, first)]
+        ):
+            ordered = ordered[1:]
+    return ordered[0] if ordered else len(lines)
+
+
+def _canonical_markdown(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    levels = _heading_levels(lines)
+    header_end = _header_end(lines, levels)
+    out = []
+    section = None
+    for index, line in enumerate(lines):
+        if index < header_end and _GENERATED_LINE.match(line):
+            continue
+        # Any heading at any level ends the TX-008 section. Matching only
+        # `### TX-\d+` would leave `section` latched onto TX-008 for the rest of
+        # the document.
+        if index in levels:
             heading = _TX_HEADING.match(line)
             section = heading.group(1) if heading else None
         if section == NORMALISED_HEURISTIC:
@@ -172,39 +236,55 @@ def _sort_markdown_documents(line: str) -> str:
     return f"{prefix}{', '.join(f'`{i}`' for i in sorted(ids))}{newline}"
 
 
-def canonical_bytes(raw: bytes, suffix: str) -> bytes:
-    """Return a canonical form of `raw`, or `raw` itself if it is not a report.
+def canonicalise(raw: bytes, suffix: str) -> bytes | None:
+    """Canonical form of `raw`, or None if it is not a machine-readable report.
 
-    Anything that is not a .json, .jsonl or .md file is returned untouched: a
-    .txt or .csv sidecar is not Markdown, and running it through the Markdown
-    normaliser would mean reordering text in a file whose format we do not know.
+    None means "not parsed", which the caller must know: a run whose every file
+    fails to parse must not be reported as deterministic. "Could not compare"
+    and "compared equal" are different answers, and conflating them is how a
+    gate passes vacuously.
     """
     if suffix not in (".json", ".jsonl", ".md"):
-        return raw
+        return None
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         # Not text. Comparing the bytes is stricter than comparing a lossy
         # decode, which would report two different files as identical.
-        return raw
+        return None
     if suffix == ".json":
         canonical = _canonical_json(text)
     elif suffix == ".jsonl":
         canonical = _canonical_jsonl(text)
     else:
         canonical = _canonical_markdown(text)
-    if canonical is None:
-        # Not machine-readable after all. Comparing raw text is still a real
-        # comparison, so this is a fallback rather than a skip.
-        return raw
-    return canonical.encode("utf-8")
+    return None if canonical is None else canonical.encode("utf-8")
+
+
+def canonical_bytes(raw: bytes, suffix: str) -> bytes:
+    """Canonical form of `raw`, falling back to the raw bytes.
+
+    Anything that is not a parsed report is returned untouched: a .txt or .csv
+    sidecar is not Markdown, and running it through the Markdown normaliser
+    would mean reordering text in a file whose format we do not know.
+    """
+    canonical = canonicalise(raw, suffix)
+    return raw if canonical is None else canonical
 
 
 def describe_policy() -> str:
+    """What the comparison permits, stated in full.
+
+    JSON is re-serialised, which also absorbs key order, indentation, escape
+    form and number form. Those are properties of *formatting* rather than
+    results, but they are still things the comparison lets through, and the
+    previous wording named three allowances while relying on several more.
+    """
     return (
-        f"top-level '{REPORT_METADATA_KEY}' in JSON reports, the "
-        f"'**Generated:**' header line in Markdown, and {NORMALISED_HEURISTIC} "
-        f"doc_ids order"
+        f"Permitted variation: JSON re-serialisation (key order, whitespace, "
+        f"escape form, number form), the top-level '{REPORT_METADATA_KEY}' key "
+        f"in JSON reports, the '**Generated:**' header line in Markdown, and "
+        f"{NORMALISED_HEURISTIC} doc_ids order."
     )
 
 
@@ -213,25 +293,35 @@ def describe_policy() -> str:
 # --------------------------------------------------------------------------
 
 
-def run_demo(dest: Path) -> None:
+def run_demo(dest: Path, run_number: int) -> None:
     """Run `python -m toxindb demo` once, into `dest`.
 
     `python -m` puts the working directory first on `sys.path`, so this
-    deliberately measures the checkout: the demo job installs editable, and
-    the gate teeth script injects its mutations into a copy of the tree that
-    only takes effect if the copy is what gets imported. The cost is that
-    `ensure_demo_traces()` rewrites the committed fixtures on every run, so the
-    tree assertion in `main()` is what keeps that honest. Today the rewritten
-    bytes match what is committed and the assertion passes; the day
-    `trace_gen.py` changes they will not, and that is the point of asserting it
-    rather than assuming it.
+    deliberately measures the checkout: the demo job installs editable, and the
+    gate teeth script injects its mutations into a copy of the tree that only
+    takes effect if the copy is what gets imported. Running the demo this way
+    also means `trace_gen.get_traces_dir()` resolves to the checkout, so the
+    demo *could* write into the tree being guarded, and `main()` asserts that it
+    does not. In practice `ensure_demo_traces()` skips every fixture that
+    already exists, so nothing is written -- which is why that assertion is a
+    net rather than a tripwire.
+
+    `run_number` is exported as `TOXINDB_DETERMINISM_RUN`. Nothing in toxindb
+    reads it; the teeth script's mutations do. A test for "this output differs
+    between runs" needs the two runs to actually differ, and the only way to
+    arrange that without a coin flip is to tell the run which run it is. Doing
+    so makes those cases deterministic: previously they rolled the dice, and on
+    the rare occasion every roll matched, the gate concluded the check was blind
+    and failed. The variable is the difference between "can fail" and "will".
     """
     if dest.exists():
         shutil.rmtree(dest)
+    env = dict(os.environ, TOXINDB_DETERMINISM_RUN=str(run_number))
     completed = subprocess.run(
         [sys.executable, "-m", "toxindb", "demo", "--output", str(dest)],
         capture_output=True,
         text=True,
+        env=env,
     )
     if completed.returncode != 0:
         sys.stderr.write(completed.stdout)
@@ -262,33 +352,52 @@ def _read(path: Path) -> bytes:
     return path.read_bytes()
 
 
+class GitUnavailable(RuntimeError):
+    """`git` could not be executed at all.
+
+    Deliberately distinct from "not a repository": the latter is a legitimate
+    reason to skip the assertion with a note, but a missing git binary means
+    the safety net silently vanishes, which must be a hard failure.
+    """
+
+
 def _tree_state(root: Path) -> str | None:
     """A snapshot of the working tree, including gitignored paths.
 
     Returns None outside a git checkout, where the assertion is skipped with a
     printed note rather than assumed to have passed.
 
+    `--ignored=traditional` rather than `--ignored=matching`. `matching`
+    collapses an ignored *directory* to a single `!! reports/` line, so nothing
+    inside it can ever change the snapshot -- verified: writing
+    `reports/LEAKED_SECRET.json` into an already-ignored `reports/` left the
+    snapshot byte-identical. `traditional` lists the files, so a new one shows
+    up. (A content change to an already-ignored file remains invisible, because
+    git does not track such files at all; only the file *list* is compared.)
+
     Byte-code caches are filtered out. They are created by *importing* the
     package, so they appear during any run that imports toxindb and say nothing
     about whether the run wrote to the tree. They are also the one ignored path
     guaranteed to be new on a fresh CI checkout, which is exactly what happened:
     the first version of this assertion failed on `!! toxindb/__pycache__/` and
-    nothing else. The filter is deliberately narrow -- only `__pycache__`
-    directories and `.pyc` files -- because everything else, including ignored
-    data files, is a real signal.
+    nothing else. The filter is narrow -- `__pycache__` paths and `.pyc` files --
+    because everything else, including ignored data files, is a real signal.
     """
-    proc = subprocess.run(
-        [
-            "git",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--ignored=matching",
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=traditional",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise GitUnavailable(str(exc)) from exc
     if proc.returncode != 0:
         return None
     return "".join(
@@ -304,14 +413,18 @@ def _assert_tree_unchanged(before: str | None, after: str | None, root: Path) ->
         return 0
     if before == after:
         return 0
-    # This is a real finding, and the same one the docs gate asserts. The demo
-    # regenerates its fixtures through `trace_gen.ensure_demo_traces()`, which
-    # writes relative to the *package* directory. Under the editable install the
-    # demo job uses, that is the checkout, so the fixtures are rewritten on every
-    # run. It is currently invisible because the regenerated bytes match what is
-    # committed -- which is exactly what a changed `trace_gen.py` would break
-    # first. Verified: mutating fixture generation leaves this script reporting
-    # "deterministic" while the three committed traces are modified.
+    # A real finding, and the same one the docs gate asserts. The demo resolves
+    # its fixture directory through `trace_gen.get_traces_dir()`, which is
+    # relative to the *package* directory rather than to the working directory.
+    # Under the editable install the demo job uses, that is the checkout.
+    #
+    # `ensure_demo_traces()` guards every write with `if not os.path.exists(...)`,
+    # so on a normal run the committed fixtures are left untouched and this
+    # assertion stays quiet. That is precisely what makes it worth having: it is
+    # a safety net for the change that removes that guard, or adds a write
+    # somewhere else. Verified by injecting an unconditional write into the
+    # installed package: the demo still reported "deterministic", and this
+    # assertion is what caught it.
     print(
         f"::error::running the demo modified the working tree at {root}, so the "
         f"fixtures this comparison used are not the ones the repository ships",
@@ -361,9 +474,9 @@ def main() -> int:
         repo_root = Path(__file__).resolve().parents[2]
         tree_before = _tree_state(repo_root)
 
-        run_demo(live)
+        run_demo(live, 1)
         shutil.copytree(live, first, dirs_exist_ok=True)
-        run_demo(live)
+        run_demo(live, 2)
         shutil.copytree(live, second, dirs_exist_ok=True)
 
         verdict = _compare(first, second)
@@ -373,11 +486,34 @@ def main() -> int:
         # the fixtures is not a result at all.
         dirty = _assert_tree_unchanged(tree_before, _tree_state(repo_root), repo_root)
         return verdict or dirty
+    except GitUnavailable as exc:
+        print(
+            f"error: `git` could not be run ({exc}), so this script cannot show "
+            f"that the demo left the working tree alone. Install git, or delete "
+            f"this job -- silently dropping the check would be worse than the "
+            f"crash.",
+            file=sys.stderr,
+        )
+        return 2
     except OSError as exc:
         # This script's whole thesis is that a crash is not a result. An
         # unwritable or full scratch directory must not escape as a traceback
         # whose exit code is indistinguishable from a determinism verdict.
-        print(f"error: scratch directory {scratch} is unusable: {exc}", file=sys.stderr)
+        #
+        # `shutil.copytree` reports per-file failures as a list inside the
+        # exception, and a dangling symlink in the demo's output is one of them.
+        # Blaming the scratch *directory* for a single broken file points the
+        # reader at the wrong place, so the individual reasons are printed too.
+        detail = ""
+        args = getattr(exc, "args", ())
+        if args and isinstance(args[0], list):
+            detail = "\n" + "\n".join(
+                f"  {item[0]}: {item[2]}" for item in args[0] if len(item) >= 3
+            )
+        print(
+            f"error: the scratch area {scratch} could not be used: {exc}{detail}",
+            file=sys.stderr,
+        )
         return 2
     finally:
         if temporary:
@@ -406,14 +542,21 @@ def _compare(first: Path, second: Path) -> int:
         )
         return 1
 
-    empty = []
+    readable = 0
     for rel in sorted(common):
         raw_a = _read(first / rel)
         raw_b = _read(second / rel)
-        if not raw_a and not raw_b:
-            empty.append(str(rel))
-        a = canonical_bytes(raw_a, rel.suffix)
-        b = canonical_bytes(raw_b, rel.suffix)
+        canon_a = canonicalise(raw_a, rel.suffix)
+        canon_b = canonicalise(raw_b, rel.suffix)
+        if canon_a is not None and canon_b is not None and canon_a and canon_b:
+            # Parsed, and there is content in it. This is the only kind of
+            # file that can support a determinism claim.
+            readable += 1
+        # Not machine-readable: fall back to comparing the bytes. That is still
+        # a real comparison -- it is what catches two different non-UTF-8
+        # sidecars -- but it does not count towards `readable` below.
+        a = raw_a if canon_a is None else canon_a
+        b = raw_b if canon_b is None else canon_b
         if a == b:
             continue
         print(f"::error::{rel} differs between runs")
@@ -432,14 +575,16 @@ def _compare(first: Path, second: Path) -> int:
             print(f"  ... and {len(diff) - 40} more diff line(s)")
         failures += 1
 
-    # The zero-*files* case above is caught by `common` being empty. The
-    # zero-*content* analogue is not: a demo that writes only empty or
-    # unparseable files compares clean, and would be reported as deterministic
-    # without this.
-    if len(empty) == len(common):
+    # Comparing nothing proves nothing. The zero-*files* case is caught by
+    # `common` being empty above. The zero-*content* case is not, and it has two
+    # shapes: a demo that writes only empty files, and a demo that writes only
+    # files this script cannot parse. Both compare clean and would be reported
+    # as deterministic. The earlier guard counted 0-byte files only, so a demo
+    # that wrote `{not json` twice passed while proving nothing.
+    if readable == 0:
         print(
-            "::error::every compared file was empty, so there is nothing to "
-            "compare and determinism cannot be claimed"
+            "::error::no compared file was non-empty and machine-readable, so "
+            "there is nothing to compare and determinism cannot be claimed"
         )
         return 1
 
@@ -451,8 +596,9 @@ def _compare(first: Path, second: Path) -> int:
         return 1
 
     print(
-        f"Compared {len(common)} file(s) across two runs: the demo is "
-        f"deterministic. Normalised: {describe_policy()}."
+        f"Compared {len(common)} file(s) across two runs "
+        f"({readable} machine-readable): the demo is deterministic. "
+        f"{describe_policy()}"
     )
     return 0
 

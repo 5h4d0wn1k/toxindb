@@ -115,6 +115,26 @@ jobs:
           pip install ".[dev]"
       - name: Execute every documented command
         run: python .github/scripts/check_docs_commands.py
+      - name: Prove the docs gate can actually fail
+        # A gate nobody has watched reject bad input is not a gate. The
+        # determinism gate has its teeth tested; the docs gate did not, and it
+        # is the one that had four holes found by reading the code rather than by
+        # a failing test: a trailing `&` reported PASS with exit 0, `$(...)` was
+        # executed by /bin/sh, an unterminated fence printed `::error::` and
+        # still exited 0, and `env`/`nohup`/`timeout`/`NAME=value` wrappers were
+        # silently skipped so the job passed with nonexistent subcommands
+        # unverified. Each is a case below.
+        #
+        # This step also found a fifth defect that reading the code had missed:
+        # the closing ``` of a `python`/`json` block was parsed as the *opening*
+        # of a new unlabelled block, so any document containing one non-shell
+        # example was reported as having an unterminated fence. The shipped
+        # README contains no non-shell fences, which is the only reason it had
+        # never fired.
+        #
+        # It runs in this job on purpose: the cases invoke toxindb, so it needs
+        # the same non-editable install Guard 2 insists on.
+        run: python .github/scripts/check_docs_teeth.py
 
   # The demo is the first thing a new user runs. It must stay deterministic
   # and offline, so the build job also asserts both of those properties.
@@ -138,11 +158,12 @@ jobs:
         # This job installs editable on purpose: `python -m toxindb` puts the
         # working directory first on sys.path, and check_gate_teeth.py below
         # injects its mutations into a *copy* of the tree that only takes
-        # effect if the copy is what gets imported. The cost is that
-        # `trace_gen.ensure_demo_traces()` rewrites the committed fixtures on
-        # every run, so the script also asserts the working tree is unchanged
-        # afterwards -- today the rewritten bytes match what is committed, and
-        # the day trace_gen.py changes they will not.
+        # effect if the copy is what gets imported. Running it this way also
+        # means `trace_gen.get_traces_dir()` resolves to the checkout, so the
+        # demo *could* write into the tree the script is guarding; the script
+        # asserts that it does not. In practice `ensure_demo_traces()` skips
+        # every fixture that already exists, so nothing is written -- which is
+        # why that assertion is a safety net rather than a tripwire.
         run: python .github/scripts/check_demo_determinism.py "${RUNNER_TEMP}/det"
       - name: Prove the determinism gate can actually fail
         # A gate nobody has watched reject bad input is not a gate. This

@@ -90,8 +90,17 @@ line-length = 100
 # `select` here to match and the gate will keep them fixed from then on.
 #
 # The full `--select ALL` ruleset reports 947, and roughly half of that is
-# opinion this project has no reason to adopt: 211 asserts, 161 undocumented
-# public functions, 139 missing return annotations, 35 missing copyright
-# notices, 86 prints. Those are style positions, not defects, so the number is
-# recorded here to show what is deliberately *not* being enforced.
+# opinion this project has no reason to adopt: 211 asserts (S101), 161
+# undocumented public functions (D103), 139 missing return annotations
+# (ANN201), 32 missing copyright notices (CPY001), 25 prints (T201). Those are
+# style positions, not defects, so the number is recorded here to show what is
+# deliberately *not* being enforced.
+#
+# Measured with ruff 0.16.9 (`ruff check toxindb/ tests/ --isolated --select
+# ALL --statistics`). The `ruff` dependency below is `>=0.1`, so these counts
+# will drift as new rules are added to a future ruff; they are a record of what
+# was true when the gate was written, not a number to keep in sync. Two of them
+# were already wrong when first written -- CPY001 was recorded as 35 and T201
+# as 86 -- which is the reason for saying so here rather than implying the list
+# is authoritative.
 select = ["E9", "F63", "F7", "F811", "F82"]
