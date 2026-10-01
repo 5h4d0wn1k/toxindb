@@ -1,0 +1,91 @@
+name: Bug report
+description: Something in toxindb behaves incorrectly, or a documented command does not work.
+labels: ["bug", "status:needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. `toxindb` is a detector, so the most useful
+        report tells us what you fed it and what it said. Please read
+        [ETHICS.md](https://github.com/5h4d0wn1k/toxindb/blob/main/ETHICS.md)
+        and [SCOPE.md](https://github.com/5h4d0wn1k/toxindb/blob/main/SCOPE.md)
+        before submitting — this tool is for systems you own or are
+        authorized to assess.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: This report is about a system I own or am authorized to assess.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: toxindb version
+      description: Output of `toxindb --version`, or `python -c "import toxindb; print(toxindb.__version__)"`
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: python
+    attributes:
+      label: Python version
+      multiple: false
+      options: ["3.10", "3.11", "3.12", "3.13", "other"]
+    validations:
+      required: true
+
+  - type: dropdown
+    id: subcommand
+    attributes:
+      label: Which command produced the problem?
+      multiple: false
+      options:
+        - toxindb monitor
+        - toxindb canary
+        - toxindb provenance
+        - toxindb report
+        - toxindb demo
+        - import / library use
+        - other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        The exact commands you ran, in order, and the output you got.
+        If the input is a trace file, please say where it came from
+        (a bundled example, or a private trace) and whether you can share a
+        minimal synthetic version of it.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: trace
+    attributes:
+      label: Trace input (if applicable)
+      description: |
+        Paste the first few JSONL lines of the trace, or attach it. Anonymize
+        any real document or query text — the schema is what matters, not the
+        content.
+      render: json
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Full traceback, environment details, or links.

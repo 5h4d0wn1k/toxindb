@@ -1,0 +1,25 @@
+# toxindb's core is stdlib-only, so the Python ecosystem is almost entirely
+# irrelevant to us — there is nothing to keep current. What does need watching
+# is the supply chain we do depend on: the GitHub Actions used in CI. Those run
+# with repository credentials, so a compromised action tag is a real (if
+# indirect) risk to this project.
+#
+# Pip is intentionally absent: there are no runtime or pinned dev dependencies
+# to update, and `setuptools` is a build-time-only requirement of the build
+# backend. See https://github.com/5h4d0wn1k/toxindb/blob/main/SCOPE.md
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "layer:BLD"
+      - "phase:infra"
+    # Action updates are security-relevant here, so they get a human review
+    # rather than an unattended auto-merge.
+    open-pull-requests-limit: 5

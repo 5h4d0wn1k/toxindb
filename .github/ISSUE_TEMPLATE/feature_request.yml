@@ -1,0 +1,75 @@
+name: Feature or improvement request
+description: Propose a capability toxindb should have, or an improvement to an existing one.
+labels: ["enhancement", "status:needs-triage", "phase:feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing, please check the open `deep-review:` and
+        `improvement:` issues — the capability may already be planned, and it
+        helps us merge duplicates rather than fragment the backlog.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: This request is for a defensive / authorized-assessment use case.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        Describe the detection gap or operational friction, not the solution.
+        "I want a `--jsonl` flag" is a solution; "I need to pipe alerts into
+        my SIEM and the md report is lossy" is a problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: What do you do today instead?
+      description: If there is a workaround, describe it and its drawbacks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you'd like to see, and roughly how it should behave.
+      render: shell
+
+  - type: dropdown
+    id: compat
+    attributes:
+      label: Does this change existing output or behaviour?
+      multiple: false
+      options:
+        - "No — purely additive"
+        - "Yes — new flag/option, defaults unchanged"
+        - "Yes — changes existing defaults or output format"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area of toxindb?
+      multiple: false
+      options:
+        - Detection (a new or existing heuristic)
+        - Trace ingestion / schema
+        - Canary lifecycle
+        - Provenance / attestation
+        - Reporting
+        - CLI ergonomics
+        - Documentation
+        - Packaging / distribution
+        - Other
+    validations:
+      required: true
