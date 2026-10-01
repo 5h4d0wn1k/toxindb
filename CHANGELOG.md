@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known issues
 
 These are tracked as open issues and are **not** fixed in the current tree.
-See the [project board](https://github.com/users/5h4d0wn1k/projects/4) for
+See the [v1.0 hardening milestone](https://github.com/5h4d0wn1k/toxindb/milestone/1) for
 current status.
 
 - `SECURITY.md` directs vulnerability reports to a GitHub `users.noreply`
@@ -59,4 +59,3 @@ current status.
 - `METRICS.md` and the README cite a test count that has drifted from the
   actual suite size.
 
-[Unreleased]: https://github.com/5h4d0wn1k/toxindb/compare/HEAD...main

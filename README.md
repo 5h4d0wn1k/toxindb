@@ -378,4 +378,4 @@ Copyright (c) 2026 5h4d0wn1k.
 Changes are tracked in [CHANGELOG.md](CHANGELOG.md) under
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); issues and triage live
 in [Issues](https://github.com/5h4d0wn1k/toxindb/issues) and the
-[project board](https://github.com/users/5h4d0wn1k/projects/4).
+[v1.0 hardening milestone](https://github.com/5h4d0wn1k/toxindb/milestone/1).

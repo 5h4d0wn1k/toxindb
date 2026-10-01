@@ -1,8 +1,8 @@
 # toxindb's core is stdlib-only, so the Python ecosystem is almost entirely
 # irrelevant to us — there is nothing to keep current. What does need watching
-# is the supply chain we do depend on: the GitHub Actions used in CI and the
-# docs build. Those run with repository credentials, so a compromised action
-# tag is a real (if indirect) risk to this project.
+# is the supply chain we do depend on: the GitHub Actions used in CI. Those run
+# with repository credentials, so a compromised action tag is a real (if
+# indirect) risk to this project.
 #
 # Pip is intentionally absent: there are no runtime or pinned dev dependencies
 # to update, and `setuptools` is a build-time-only requirement of the build
