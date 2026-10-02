@@ -1,0 +1,1038 @@
+#!/usr/bin/env python3
+"""Prove that check_docs_commands.py can actually fail.
+
+The companion to check_gate_teeth.py, and it exists for the same reason. That
+script proves the *determinism* gate rejects what it is supposed to reject. The
+*docs* gate was shipped with no equivalent, and it is the gate that had four
+holes found by inspection rather than by a failing test:
+
+* ``subprocess.run(..., shell=True)`` returns the **shell's** exit status, so
+  ``toxindb nosuchsubcommand &`` printed PASS and the job exited 0.
+* ``$(...)`` and backticks were passed straight to the shell, so command
+  substitution ran -- which breaks the gate's own "no network" promise, since
+  nothing about the substitution was inspected.
+* a fence that was never closed printed ``::error::`` and still exited 0, so
+  every command after it silently went uncompared.
+* the runnable-command patterns were anchored at the start of the string, so
+  ``env toxindb ...``, ``nohup toxindb ...``, ``timeout 5 toxindb ...`` and
+  ``FOO=bar toxindb ...`` were all reported as "not a toxindb command" and
+  skipped. The job exited 0 with two nonexistent subcommands unverified.
+
+Each of those is a MUST_FAIL case here. One claim about them was wrong, and the
+correction matters more than the fix did.
+
+This docstring used to say each case was a *regression* test, and that "a future
+change that reintroduces ``shell=True`` turns the substitution case green again
+in exactly the way it was before." It does not. Verified: restoring
+``shell=True`` with a joined string leaves every case green but one. All of the
+rest is carried by ``shell_syntax_reason``, which refuses the metacharacter
+before ``subprocess.run`` is ever reached; deleting only that guard turns seven
+cases red while ``shell=False`` itself is asserted by nothing. A docstring that
+tells a reviewer a hole is closed when no test covers it is worse than the hole,
+because the reader stops looking.
+
+So ``shell=False`` now has its own case, and it works by finding the one shape
+the syntax guard cannot cover. The guard sees the raw command text, where a
+*quoted* metacharacter is an ordinary argument; ``shlex`` then strips the quotes
+and the argv vector holds a bare ``&``. A shell would treat that as an operator.
+``toxindb monitor '&'`` exits 1 with argv execution and 0 with
+``shell=True`` plus a joined string, because the second backgrounds the command
+and reports the shell's status -- the original defect, one token further along.
+
+Two rules, same as the determinism gate's:
+
+1. **A crash is not a detection.** Every MUST_FAIL case must make the gate
+   report a *verdict* -- a FAIL line for the command, or a named error -- not
+   merely exit non-zero. A mutation that broke the gate so badly it crashed
+   would otherwise score as a pass.
+2. **A gate that always fails is not a gate.** MUST_PASS runs a README the gate
+   should accept and requires exit 0.
+
+Nothing here mutates the repository. Each case writes a small synthetic README
+to a temporary file and passes it with ``--readme``; the gate resolves its own
+repository root from ``__file__``, so the real checkout is still what the tree
+assertion watches, and a case that dirtied it would be caught.
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CHECK = HERE / "check_docs_commands.py"
+
+
+class MutationFailed(Exception):
+    """The setup for a check could not be built, so the check cannot run.
+
+    Deliberately its own type rather than an `AssertionError`. A check that
+    cannot run and a check that failed look the same in the output, and only one
+    of them means the gate is broken; `main` reports the two differently.
+    """
+
+# Substrings the gate prints when it reached a verdict, as opposed to crashing.
+# A verdict is either a failing documented command or a named structural
+# complaint about the document.
+VERDICT_MARKERS = (
+    "FAIL  ",
+    "command(s) executed",
+    "code fence",
+    "no ```bash blocks found",
+    "unlabelled code fence",
+    "SKIP  ",
+    "error:",
+    "::error::",
+)
+
+
+def readme(body: str) -> str:
+    """A synthetic README whose commands all sit on line 4.
+
+    `# Synthetic README` on line 1, a blank line 2, the opening fence on line 3,
+    and the first body line on line 4. Every case below uses this single-command
+    shape where possible, so the expected line number is the same in all of them.
+    """
+    return f"# Synthetic README\n\n```bash\n{body}\n```\n"
+
+
+# The line the first command of a `readme()` body lands on. Asserted rather than
+# assumed, because a wrong expectation here reads as a gate failure and costs
+# more time than the constant is worth.
+COMMAND_LINE = 4
+
+# Line numbers for the multi-block documents below, and the gate's own
+# `f"{line_no:<5}"` padding reproduced literally -- `README.md:14` is followed by
+# four spaces, `README.md:8` by five. Spelled out rather than computed, because a
+# computed expectation that is wrong moves with the document and can never be
+# wrong in an obvious way. Both were counted by hand from the markdown in the
+# case and then confirmed against the gate's output, which is how the padding was
+# found: three of these cases failed on it the first time.
+#
+# The hidden-block document, numbered:
+#     1 # Synthetic   2 (blank)   3 Prose.   4 (blank)   5 ```bash
+#     6 toxindb --version          7 ```      8 (blank)  9 (blank)
+#    10 ```python  11 x = 1  12 (blank)     13 ```bash
+#    14 toxindb nosuchsubcommand   15 ```
+HIDDEN_FENCE_LINE = 10        # the ```python that is never closed
+HIDDEN_COMMAND_LINE = 14       # the command it was hiding
+QUOTED_COMMAND_LINE = 8        # the first command inside `> ```bash`
+
+# An absolute path outside the gate's own scratch directory, used to detect
+# whether a documented command substitution actually ran.
+#
+# The first version of this check used a bare relative filename, and it could
+# never fire. The gate runs documented commands in a `TemporaryDirectory` that
+# it removes before returning, so any file a substitution created was deleted
+# before the check looked for it -- an assertion that was incapable of failing
+# and therefore proved nothing.
+#
+# The marker is at an absolute path in the *teeth* script's own directory rather
+# than in the gate's, so a substitution that runs leaves evidence behind. It is a
+# belt-and-braces check on top of the syntax guard, and the two layers were
+# verified independently rather than assumed:
+#
+#   * removing the substitution rules from `_SHELL_SYNTAX` *and* restoring
+#     `shell=True` with a joined argv makes the marker fire, and the suite goes
+#     red naming the file it created;
+#   * restoring `shell=True` alone does NOT fire it, because `shell_syntax_reason`
+#     still refuses the line before `subprocess.run` is reached. The previous
+#     version of this comment credited the marker with catching the
+#     shell-regression alone, which is not what happens.
+#
+# So it is a real assertion -- `run_case` fails the case if the file exists
+# afterwards -- but it is reachable only when *both* layers are gone.
+NO_SIDE_EFFECT = "TEETH_SIDE_EFFECT_MARKER"
+
+
+class Case:
+    __slots__ = ("title", "markdown", "expect_rc", "expect", "marker")
+
+    def __init__(
+        self,
+        title: str,
+        markdown: str,
+        expect_rc: int,
+        expect: str | None = None,
+        marker: str | None = None,
+    ):
+        self.title = title
+        self.markdown = markdown
+        self.expect_rc = expect_rc
+        self.expect = expect
+        # Substituted in for `{marker}` when the markdown is written, so a
+        # substitution case can name a path that outlives the gate's scratch
+        # directory.
+        self.marker = marker
+
+
+# --------------------------------------------------------------------------
+# MUST FAIL -- the gate must reject each of these, and say why.
+# --------------------------------------------------------------------------
+
+MUST_FAIL = [
+    Case(
+        "a documented command that exits non-zero",
+        readme("toxindb nosuchsubcommand"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    # Finding: shell=True returned the shell's status, so the trailing `&`
+    # backgrounded a failing command and the gate reported PASS with rc 0.
+    Case(
+        "a failing command backgrounded with a trailing &",
+        readme("toxindb nosuchsubcommand &"),
+        1,
+        expect="background operator",
+    ),
+    # The ONLY case that pins `shell=False`. Every other metacharacter case is
+    # carried by the syntax guard, so with `shell=True` restored they all stay
+    # green -- which is what the module docstring used to (wrongly) claim they
+    # would catch. This one cannot be carried by the guard: `&` is quoted, so the
+    # guard sees an ordinary argument, and it is `shlex` that then strips the
+    # quotes and leaves a bare `&` in the argv vector. A shell reintroduced at
+    # the subprocess call reads that as the background operator, backgrounds the
+    # command, and reports 0 -- so the gate prints PASS for a documented command
+    # that never ran. Verified in both directions: rc=1 with argv execution,
+    # rc=0 with `shell=True` and `" ".join(argv)`.
+    Case(
+        "a quoted operator is an argument, and argv execution says so",
+        readme("toxindb monitor '&'"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    # Finding: `$(...)` reached /bin/sh and ran. The gate used to execute it,
+    # which breaks its own "no network" promise: nothing inspects the inside of
+    # a substitution. Refusing it leaves nothing to run, so the documented
+    # command is skipped -- and a README whose only command is skipped must then
+    # fail the "ran == 0" floor rather than pass. This case is the one that
+    # proves the substitution did not run: the marker path is absolute, because
+    # a relative one would be created inside the gate's scratch directory and
+    # deleted before anything could look for it.
+    Case(
+        "a README whose only command is command substitution fails",
+        readme("toxindb demo $(touch {marker})"),
+        1,
+        expect="command substitution",
+        marker="substitution",
+    ),
+    Case(
+        "backtick command substitution is refused, not executed",
+        readme("toxindb demo `touch {marker}`"),
+        1,
+        expect="backtick command substitution",
+        marker="backtick",
+    ),
+    Case(
+        "a failing command piped into a head is refused",
+        readme("toxindb nosuchsubcommand | head -1"),
+        1,
+        expect="not a toxindb command",
+    ),
+    Case(
+        "a failing command with a redirect is refused",
+        readme("toxindb nosuchsubcommand > /dev/null"),
+        1,
+        expect="redirection",
+    ),
+    Case(
+        "an unquoted wildcard is refused",
+        readme("toxindb nosuchsubcommand *.jsonl"),
+        1,
+        expect="glob",
+    ),
+    Case(
+        "variable expansion is refused",
+        readme("toxindb monitor $TRACE"),
+        1,
+        expect="variable expansion",
+    ),
+    # Finding: RUNNABLE_STEPS was anchored at the start of the string, so each
+    # of these was silently skipped and the job exited 0 with a nonexistent
+    # subcommand unverified. The correct behaviour is to RUN them, and then
+    # fail -- which is what these cases assert.
+    Case(
+        "env-wrapped invocation is run, not skipped",
+        readme("env toxindb nosuchsubcommand"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "nohup-wrapped invocation is run, not skipped",
+        readme("nohup toxindb nosuchsubcommand"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "timeout-wrapped invocation is run, not skipped",
+        readme("timeout 5 toxindb nosuchsubcommand"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "invocation with a leading variable assignment is run, not skipped",
+        readme("PYTHONHASHSEED=0 toxindb nosuchsubcommand"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "sudo is refused rather than run",
+        readme("sudo toxindb nosuchsubcommand"),
+        1,
+        expect="would change privileges",
+    ),
+    Case(
+        "every documented command skipped is a failure, not a pass",
+        readme("git clone https://github.com/5h4d0wn1k/toxindb.git"),
+        1,
+        expect="no documented command was executed",
+    ),
+]
+
+# Structural complaints. These are the document's fault, not a command's, and
+# the gate reports them before it runs anything.
+STRUCTURAL = [
+    Case(
+        "an unterminated code fence is a failure",
+        "# Synthetic\n\n```bash\ntoxindb --version\n",
+        1,
+        expect="never closed",
+    ),
+    # The closing fence of a non-shell block used to be read as the *opening* of
+    # a new unlabelled block, which was then reported as never closed -- so a
+    # perfectly ordinary document containing one `python` example failed the
+    # gate. This README has no shell blocks at all, which is a different failure
+    # and its own case.
+    Case(
+        "a README with only a non-shell block is a failure",
+        "# Synthetic\n\n```python\nprint(1)\n```\n\nAfterwards.\n",
+        2,
+        expect="no ```bash blocks found",
+    ),
+    Case(
+        "a non-shell block does not poison the shell block after it",
+        readme("toxindb --version"),
+        0,
+    ),
+    # A non-shell block left open is a failure too, and it is the other half of
+    # the defect above. Its error line was reported as `0` for a while, because
+    # the report reused the shell-block's start offset -- and an error naming
+    # line 0 is worse than no error, since it points nowhere. This one lives
+    # away from line 1 so that a regression to `start` would be visible.
+    Case(
+        "an unterminated non-shell fence is a failure, at the right line",
+        "# Synthetic\n\nProse.\n\n```python\nprint(1)\n",
+        1,
+        expect="::error::5: non-shell code fence opened here is never closed",
+    ),
+    # Tilde fences are CommonMark-valid and must be honoured, or a documented
+    # `~~~bash` block would go unchecked with no error.
+    Case(
+        "a tilde-fenced bash block is executed",
+        "# Synthetic\n\n~~~bash\ntoxindb nosuchsubcommand\n~~~\n",
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "a tilde-fenced non-shell block is consumed, not read as unlabelled",
+        "# Synthetic\n\n~~~python\nprint(1)\n~~~\n\n```bash\ntoxindb --version\n```\n",
+        0,
+    ),
+    # An unterminated non-shell fence used to swallow every ```bash block after
+    # it, because the `bash` line was accepted as its closer. Nothing was
+    # printed, nothing was skipped, and the job was green with a documented
+    # `nosuchsubcommand` unverified -- the exact shape of hole this script
+    # exists to close. Two assertions, because the two halves fail separately:
+    # the structural error names the *python* fence, and the command inside the
+    # block the python fence was hiding is actually run and reported.
+    Case(
+        "an unterminated non-shell fence does not hide a later bash block",
+        "# Synthetic\n\nProse.\n\n```bash\ntoxindb --version\n```\n\n\n"
+        "```python\nx = 1\n\n```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect=f"FAIL  README.md:{HIDDEN_COMMAND_LINE}    toxindb nosuchsubcommand",
+    ),
+    Case(
+        "that hidden block is also reported as an unclosed fence",
+        "# Synthetic\n\nProse.\n\n```bash\ntoxindb --version\n```\n\n\n"
+        "```python\nx = 1\n\n```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect=(
+            f"::error::{HIDDEN_FENCE_LINE}: non-shell code fence "
+            f"opened here is never closed"
+        ),
+    ),
+    # `||` runs its right-hand side precisely because the left-hand side failed,
+    # so the line succeeds. Treating it as `&&` reported a correct documented
+    # command as broken, which is how a maintainer learns to ignore a red job.
+    Case(
+        "a || chain succeeds when the second command succeeds",
+        readme("toxindb nosuchsubcommand || toxindb --version"),
+        0,
+        expect=f"PASS  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "a || chain fails when both commands fail",
+        readme("toxindb nosuchsubcommand || toxindb alsonosuchsubcommand"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    Case(
+        "a && chain still stops at the first failure",
+        readme("toxindb nosuchsubcommand && toxindb --version"),
+        1,
+        expect=f"FAIL  README.md:{COMMAND_LINE}",
+    ),
+    # A fenced block inside a block quote is a block a reader will copy. The
+    # fence pattern was anchored at column 0, so `> ```bash` never matched and
+    # the block was invisible -- with no skip reason, and with the
+    # "no documented command was executed" floor satisfied by whatever other
+    # block the document had.
+    Case(
+        "a block-quoted bash fence is executed",
+        "# Synthetic\n\n```bash\ntoxindb --version\n```\n\n"
+        "> ```bash\n> toxindb nosuchsubcommand\n> ```\n",
+        1,
+        expect=f"FAIL  README.md:{QUOTED_COMMAND_LINE}     toxindb nosuchsubcommand",
+    ),
+    # The mirror image: an *unquoted* `#` inside a filename is a legal token in a
+    # shell too, and refusing it silently cost a real command its check.
+    Case(
+        "a hash inside a filename is not a comment",
+        readme("toxindb monitor 'examples/traces/poison_trace.jsonl' --output r#1/"),
+        0,
+        expect=f"PASS  README.md:{COMMAND_LINE}",
+    ),
+    # A closing fence must be at least as long as the opener. Comparing only the
+    # fence *character* let a 3-backtick line close a 4-backtick ```bash block,
+    # so everything after it was read as document text -- no skip reason, no
+    # structural error, exit 0, and a documented `nosuchsubcommand` never run.
+    # Counted by hand from the markdown: 1 `# T`, 2 blank, 3 ````bash opener,
+    # 4 the good command, 5 the short closer, 6 the hidden bad command.
+    Case(
+        "a short closer does not close a longer opener",
+        "# Synthetic\n\n````bash\ntoxindb --version\n```\n"
+        "toxindb nosuchsubcommand\n`````\n",
+        1,
+        expect=f"FAIL  README.md:6     toxindb nosuchsubcommand",
+    ),
+    # The other half, and the reason it needed two cases: with no real closer at
+    # all the block *looked* closed, so no unclosed-fence error was printed
+    # either. A structure the parser rejects should say so, not just fail.
+    Case(
+        "a short closer is also reported as an unclosed fence",
+        "# Synthetic\n\n````bash\ntoxindb --version\n```\n",
+        1,
+        expect="::error::3: code fence opened here is never closed",
+    ),
+    # The control, so the fix is not simply "always require four backticks": a
+    # longer closer than the opener is legal and must still close the block.
+    Case(
+        "a longer closer than the opener still closes it",
+        "# Synthetic\n\n```bash\ntoxindb --version\n`````\n",
+        0,
+        expect=f"PASS  README.md:4     toxindb --version",
+    ),
+    # The same length rule on the *other* branch. The fence-length fix above
+    # covered only the `bash` branch, so the `ignoring` branch -- the one that
+    # skips non-shell fences -- kept accepting any shorter fence as a closer and
+    # separately treated one as a new opener. A 3-backtick fence inside a
+    # 4-backtick ````markdown block is the ordinary way to document a fenced
+    # block, and the gate reported the outer fence unterminated and then opened
+    # the content as a new block, swallowing the ```bash after it. The
+    # document renders as two blocks in every CommonMark implementation.
+    #
+    #     1 # Synthetic   2 (blank)   3 ````markdown   4 ```   5 x   6 ```
+    #     7 ````         8 (blank)   9 ```bash        10 the command   11 ```
+    # `nosuchsubcommand` is the load-bearing part: it is only ever reached if the
+    # ```bash block survives, so this case fails if the block is swallowed again.
+    Case(
+        "a short fence inside a longer markdown fence is content, not a block",
+        "# Synthetic\n\n````markdown\n```\nx\n```\n````\n\n"
+        "```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect="FAIL  README.md:10    toxindb nosuchsubcommand",
+    ),
+    # ...and the control for that one: with the shorter fence treated as an
+    # opener rather than content, the *inner* block opens at line 4 and closes at
+    # line 6, so the ```` at line 7 opens a second block that is never closed --
+    # and the ```bash block after it is never reached, so no `FAIL` is printed
+    # for a command that is right there in the document. That second unclosed
+    # block is where the *second* error came from, not from line 4.
+    Case(
+        "and the block after such a fence is still reached",
+        "# Synthetic\n\n````markdown\n```\nx\n```\n````\n\n"
+        "```bash\ntoxindb --version\n```\n",
+        0,
+        expect="PASS  README.md:10    toxindb --version",
+    ),
+    # The *character* half of the same rule, in the other direction. The
+    # `ignoring` branch had the length half but not the character half, so a
+    # ``` fence inside a ~~~text fence was treated as significant: the balanced
+    # ~~~text block was reported unterminated, the content was then opened as a
+    # new block, and the ```bash after it was swallowed. The document renders
+    # as two blocks with the second one real -- checked against
+    # `commonmark.commonmark`. Nothing in this README has a tilde fence, so
+    # this cannot fire on the current file, which is exactly why it needs a
+    # case rather than a reviewer's eye.
+    #
+    #     1 # Synthetic  2 (blank)  3 ~~~text  4 ```  5 x  6 ```  7 ~~~
+    #     8 (blank)  9 ```bash  10 the command  11 ```
+    Case(
+        "a backtick fence inside a tilde fence is content, not a block",
+        "# Synthetic\n\n~~~text\n```\nx\n```\n~~~\n\n"
+        "```bash\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect="FAIL  README.md:10    toxindb nosuchsubcommand",
+    ),
+    # The control for the control: if the ``` inside ~~~text were accepted as a
+    # *closer*, the ~~~text block would end at line 6, the ~~~ at line 7 would
+    # open a new fence, and the command at line 10 would never be run at all.
+    Case(
+        "and the block after a tilde fence is still reached",
+        "# Synthetic\n\n~~~text\n```\nx\n```\n~~~\n\n"
+        "```bash\ntoxindb --version\n```\n",
+        0,
+        expect="PASS  README.md:10    toxindb --version",
+    ),
+    # A fence indented four spaces is an *indented code block* -- prose -- and
+    # `cmark` renders it as such. Treating it as a fence meant the gate executed
+    # command text the document never claims is runnable, and reported FAIL for
+    # it. An indented ` ```bash ` block is what a fence inside an indented list
+    # or after a wrapped paragraph looks like, so this is not a contrived input.
+    #
+    # rc 2, not 0: this document's only block is prose, so the gate finds no
+    # shell blocks and refuses to pass vacuously, saying so. That is the
+    # outcome worth pinning. Before the fix the block was read as a fence, the
+    # command was executed, and the gate printed
+    # `FAIL README.md:4 toxindb nosuchsubcommand` for a line the document
+    # renders as prose. The load-bearing assertion is the absence of that
+    # `FAIL`, plus a named reason for the refusal.
+    Case(
+        "a fence indented four spaces is prose, not a runnable block",
+        "# Synthetic\n\n    ```bash\n    toxindb nosuchsubcommand\n    ```\n",
+        2,
+        expect="no ```bash blocks found",
+    ),
+    # ...and the control, because a fix for the above that simply forbade all
+    # indentation would pass it while breaking the ordinary three-space form,
+    # which is how a fence inside a list item is written.
+    Case(
+        "a fence indented three spaces is still a fence",
+        "# Synthetic\n\n   ```bash\n   toxindb --version\n   ```\n",
+        0,
+        expect="PASS  README.md:4     toxindb --version",
+    ),
+    # A backtick fence's info string may not contain a backtick, so
+    # ```ba`sh is a paragraph in CommonMark. `_SHELL_WORDS` still found `sh` at
+    # a word boundary, so the block was collected and executed. The refusal
+    # here is the point: a document that does not document a command must not
+    # have one run, and the two `::error::` lines say the structure is broken
+    # rather than silently reporting zero commands.
+    Case(
+        "a backtick in a backtick info string does not make a fence",
+        "# Synthetic\n\n```ba`sh\ntoxindb nosuchsubcommand\n```\n",
+        1,
+        expect="is never closed",
+    ),
+    # The control: a *tilde* fence may carry a backtick in its info string, so a
+    # fix that rejected the info string generally rather than only for backtick
+    # fences would pass the case above and break this one.
+    Case(
+        "and a tilde fence may carry a backtick in its info string",
+        "# Synthetic\n\n~~~ba`sh\ntoxindb --version\n~~~\n",
+        0,
+        expect="PASS  README.md:4     toxindb --version",
+    ),
+    # `> ` is a block-quote marker only inside a block quote. In a plain ```bash
+    # block it is ordinary content, and a session transcript is written exactly
+    # that way. Stripping it unconditionally made the gate *execute* the quoted
+    # line. A fence genuinely inside a block quote still has to work, so the
+    # marker is now stripped per-block, decided at the opener.
+    Case(
+        "a fence inside a block quote is still a shell block",
+        "# Synthetic\n\n> ```bash\n> toxindb nosuchsubcommand\n> ```\n",
+        1,
+        expect="FAIL  README.md:4     toxindb nosuchsubcommand",
+    ),
+    # A fence on a list-item bullet. The marker used to hide the opener, so the
+    # closing ``` was read as a new unlabelled opener which swallowed the next
+    # real block, and the document failed with "no ```bash blocks found" while
+    # containing one.
+    Case(
+        "a fence on a list-item bullet is still a shell block",
+        "# Synthetic\n\n- ```bash\n  toxindb nosuchsubcommand\n  ```\n",
+        1,
+        expect="FAIL  README.md:4     toxindb nosuchsubcommand",
+    ),
+]
+
+# --------------------------------------------------------------------------
+# MUST PASS -- a gate that rejects everything is not a gate.
+# --------------------------------------------------------------------------
+
+MUST_PASS = [
+    Case(
+        "a README whose only command runs",
+        readme("toxindb --version"),
+        0,
+    ),
+    # A refused command next to a good one is not itself a failure: refusing it
+    # loudly *is* the correct behaviour, and the job still has a real result to
+    # report. This is the case that would fail if "refuse" were ever turned into
+    # "fail" -- which would make the gate reject a README for having a
+    # `$(...)` in it rather than for anything being wrong with toxindb.
+    Case(
+        "a passing command alongside a refused one still passes",
+        readme("toxindb demo $(touch {marker})\n"
+               "toxindb --version"),
+        0,
+        expect="command substitution",
+        marker="alongside",
+    ),
+    Case(
+        "a quoted metacharacter is a plain argument, not shell syntax",
+        readme("toxindb monitor 'examples/traces/poison_trace.jsonl'"),
+        0,
+    ),
+]
+
+# The substitution cases must not have produced their side effect. The marker
+# is named in a temporary directory beside the synthetic README, because the
+# gate runs documented commands inside a scratch directory that it deletes
+# before returning -- see NO_SIDE_EFFECT above.
+
+
+def run_gate(
+    markdown: str, workdir: Path, check: Path = CHECK
+) -> tuple[int, str]:
+    """Run the gate under test against `markdown`, with `workdir` as its CWD.
+
+    `check` defaults to this repository's own gate. The one case that needs
+    otherwise passes a *copy's* script on purpose: the gate resolves its
+    repository root from `__file__`, so the copy's script is the only way to
+    make it watch a scratch checkout instead of the real one.
+    """
+    readme_path = workdir / "README.md"
+    readme_path.write_text(markdown, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(check), "--readme", str(readme_path)],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------
+# The working-tree safety net
+# --------------------------------------------------------------------------
+#
+# `_tree_state` is the only evidence that running the documented commands did
+# not rewrite the repository's own fixtures, and nothing above exercises it:
+# `run_case` hands the gate a scratch directory with no `.git`, so the
+# assertion is legitimately skipped in every case above. Neutralising the function
+# entirely left this script green, which is how a docstring came to claim a
+# verification nobody had run.
+#
+# Called directly against real checkouts rather than through `run_gate`, because
+# the property is about `git status` and about which failures are silent -- and
+# a scratch directory cannot express either.
+
+_GATE: object | None = None
+
+
+def _gate() -> object:
+    """Import check_docs_commands.py so its internals can be called directly."""
+    global _GATE
+    if _GATE is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "docs_gate_under_test", HERE / "check_docs_commands.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _GATE = module
+    return _GATE
+
+
+def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise MutationFailed(f"`git` is not on PATH ({exc}); this check cannot run") from exc
+
+
+def _git_ok(args: list[str], cwd: Path) -> None:
+    """`git`, but a failure to set up is a `MutationFailed` rather than a verdict.
+
+    `_git` returns its result for the cases that *want* to inspect one. Setup
+    here has no such case: if `git init` or `commit` fails, every later
+    assertion is measuring a checkout that was never built, and the check would
+    report a gate defect for a failure of its own making.
+    """
+    proc = _git(args, cwd)
+    if proc.returncode != 0:
+        raise MutationFailed(
+            f"`{' '.join(args)}` failed in {cwd.name}: "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
+
+
+def check_tree_state() -> list[str]:
+    """Prove `_tree_state` reports a change, and stays quiet about a non-checkout.
+
+    Five properties. The two that matter most are the first and the third: a
+    gate that cannot see a write, and a gate that reports one it cannot see.
+    """
+    problems: list[str] = []
+    gate = _gate()
+    results: list[tuple[str, bool, str]] = []
+
+    with tempfile.TemporaryDirectory(prefix="docs-tree-") as tmp:
+        outside = Path(tmp)
+        checkout = outside / "checkout"
+        checkout.mkdir()
+        init = _git(["git", "init", "-q"], checkout)
+        if init.returncode != 0:
+            raise MutationFailed(f"`git init` failed: {init.stderr.strip()}")
+
+        before = gate._tree_state(checkout)
+        # A file git already tracks, plus a new untracked one: both must show.
+        (checkout / "TREE_PROBE.txt").write_text("x", encoding="utf-8")
+        after_new_file = gate._tree_state(checkout)
+        same = gate._tree_state(checkout)
+
+        # `.gitignore` is written *before* the baseline, and so is the ignored
+        # directory's first file. The previous version of this block created
+        # both after the baseline, so `?? .gitignore` arrived as an extra line
+        # and satisfied `after_ignored != same` under every flag setting --
+        # including `--ignored=none` and a deleted `--ignored` flag, which is
+        # exactly the configuration this property exists to forbid. An assertion
+        # that an unrelated file can satisfy is not an assertion.
+        (checkout / ".gitignore").write_text("reports/\n", encoding="utf-8")
+        (checkout / "reports").mkdir()
+        (checkout / "reports" / "first.json").write_text("{}", encoding="utf-8")
+        ignored_before = gate._tree_state(checkout)
+        # A *second* file into an already-ignored directory, which is the case
+        # `--ignored=matching` hides: it collapses the directory to one
+        # `!! reports/` line and never re-expands, so the snapshot comes back
+        # byte-identical. `--ignored=none` hides it too.
+        (checkout / "reports" / "LEAKED_SECRET.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        after_ignored = gate._tree_state(checkout)
+
+        results.append(("a new untracked file changes the snapshot",
+                        before != after_new_file, "expected a difference"))
+        results.append(("an unchanged tree yields an identical snapshot",
+                        after_new_file == same, "expected no difference"))
+        results.append((
+            "a new file in an ignored directory changes the snapshot",
+            after_ignored != ignored_before,
+            "expected a difference: `--ignored=matching` and no flag at all "
+            "both report an ignored directory as one collapsed line",
+        ))
+        results.append((
+            "and the file is named in the snapshot, not just its directory",
+            after_ignored is not None
+            and "LEAKED_SECRET.json" in after_ignored,
+            "expected the path to appear in `git status --ignored=traditional`",
+        ))
+
+        # Not a checkout: skipped with a note, never silently assumed to have
+        # passed. `_tree_state` returns None for this and for nothing else.
+        plain = outside / "plain"
+        plain.mkdir()
+        results.append(("a directory with no .git anywhere is skipped",
+                        gate._tree_state(plain) is None, "expected None"))
+
+        # Git present, in a real checkout, and failing. This used to be reported
+        # as the "not a git checkout" skip, which is the opposite of the truth
+        # and left the only tree assertion in the gate switched off.
+        corrupt = outside / "corrupt"
+        corrupt.mkdir()
+        _git(["git", "init", "-q"], corrupt)
+        (corrupt / ".git" / "index").write_bytes(b"DIRC\0\0\0\0garbage")
+        try:
+            gate._tree_state(corrupt)
+            refused = False
+        except gate.GitRefused:
+            refused = True
+        except Exception as exc:  # noqa: BLE001 - wrong exception type is a failure
+            problems.append(
+                f"a corrupt index raised {type(exc).__name__} rather than "
+                f"GitRefused: the error type is what main() dispatches on"
+            )
+            refused = True
+        results.append(("a corrupt index in a checkout is refused, not skipped",
+                        refused, "expected GitRefused"))
+
+    for label, ok, why in results:
+        if not ok:
+            problems.append(f"{label}: {why}")
+        print(f"  {'ok' if ok else 'WRONG':>5}  {label}")
+    return problems
+
+
+# --------------------------------------------------------------------------
+# The working-tree verdict
+# --------------------------------------------------------------------------
+#
+# `check_tree_state` above proves that `_tree_state` notices a change. It says
+# nothing about whether a noticed change becomes a non-zero *exit*, because the
+# verdict lives in `main()`, two frames away and one `elif` further on.
+#
+# That gap was live. Changing `return 1` to `return 0` in the tree-assertion
+# branch -- one character -- left this entire suite green, while its summary
+# still reported that it "saw a real tree change". The suite was describing the
+# snapshot function, not the assertion the reader is being asked to trust.
+#
+# So this check drives the gate end to end, twice, and the second run removes
+# the thing the first run proved. A non-zero exit on its own would not be
+# enough: the mutation could simply break the gate in some unrelated way, so
+# the first run also insists the exit came with the tree message, and the
+# second run insists the gate goes quiet once the assertion is disarmed.
+
+_TREE_VERDICT_RETURN = (
+    '        for line in _diff_lines(tree_before, tree_after):\n'
+    '            print(f"  {line}", file=sys.stderr)\n'
+    '        return 1\n'
+    '    elif dirty:'
+)
+
+_TREE_VERDICT_MESSAGE = "running the documented commands modified the working tree"
+
+
+def _copy_repo_without_history(destination: Path) -> None:
+    """Copy the repository to `destination`, minus `.git`.
+
+    `.git` is dropped rather than copied because the copy has to be a checkout
+    the check creates itself: `git init` over a copied history would let the
+    real repository's index, and its `.gitignore`, decide what the copy sees.
+    """
+    shutil.copytree(
+        HERE.parent.parent,
+        destination,
+        ignore=shutil.ignore_patterns(".git"),
+        symlinks=True,
+    )
+
+
+def check_tree_verdict() -> list[str]:
+    """Prove a dirty working tree fails the gate, and that failing is load-bearing."""
+    problems: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="docs-verdict-") as tmp:
+        outside = Path(tmp)
+
+        for label, disarm, want_rc, want_message in (
+            ("a documented command that writes into the checkout fails the gate",
+             False, 1, True),
+            # The annotation survives; only the exit code changes. That is
+            # precisely the shape of the defect: GitHub renders a red
+            # `::error::` on a job that passed, so the evidence is on the page
+            # and the enforcement is not. So this case asserts the exit code and
+            # says nothing about the message, because a disarmed assertion still
+            # prints one.
+            ("and exits 0 once the tree assertion returns 0 instead",
+             True, 0, None),
+        ):
+            root = outside / ("disarmed" if disarm else "armed")
+            checkout = root / "checkout"
+            workdir = root / "workdir"
+            workdir.mkdir(parents=True)
+            try:
+                _copy_repo_without_history(checkout)
+                _git_ok(["git", "init", "-q"], checkout)
+                # A commit, so the baseline is a tracked tree rather than a
+                # directory of untracked files. Without it every file in the
+                # copy is `??` and the diff after the run is unreadable.
+                _git_ok(["git", "add", "-A"], checkout)
+                _git_ok(
+                    ["git", "-c", "user.email=t@example.invalid",
+                     "-c", "user.name=teeth", "commit", "-qm", "baseline"],
+                    checkout,
+                )
+                if disarm:
+                    gate_path = checkout / ".github" / "scripts" / "check_docs_commands.py"
+                    text = gate_path.read_text(encoding="utf-8")
+                    if text.count(_TREE_VERDICT_RETURN) != 1:
+                        problems.append(
+                            f"{label}: the tree-assertion branch does not appear "
+                            f"exactly once in the gate under test, so this case "
+                            f"cannot disarm it: {_TREE_VERDICT_RETURN!r}"
+                        )
+                        continue
+                    gate_path.write_text(
+                        text.replace(
+                            _TREE_VERDICT_RETURN,
+                            _TREE_VERDICT_RETURN.replace("        return 1", "        return 0"),
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                # The command writes to an absolute path inside the copy. The
+                # gate runs documented commands in a TemporaryDirectory of its
+                # own, so a relative `--output` would land outside the checkout
+                # and the tree would stay clean -- the case would pass for the
+                # wrong reason, in the direction that matters least.
+                markdown = readme(f"toxindb demo --output {checkout / 'reports'}")
+                rc, output = run_gate(
+                    markdown, workdir,
+                    check=checkout / ".github" / "scripts" / "check_docs_commands.py",
+                )
+            except (MutationFailed, OSError) as exc:
+                problems.append(f"{label}: {exc}")
+                continue
+
+            if rc != want_rc:
+                problems.append(
+                    f"{label}: expected exit {want_rc}, got {rc}. Output: "
+                    f"{output.strip()[-500:]}"
+                )
+            has_message = _TREE_VERDICT_MESSAGE in output
+            if want_message is not None and has_message != want_message:
+                problems.append(
+                    f"{label}: expected "
+                    f"{'the tree message' if want_message else 'no tree message'}, "
+                    f"got {'it' if has_message else 'none'}. Output: "
+                    f"{output.strip()[-500:]}"
+                )
+            if "Traceback (most recent call last)" in output:
+                problems.append(f"{label}: the gate crashed instead of reaching a verdict")
+
+            ok = rc == want_rc and (
+                want_message is None or has_message == want_message
+            )
+            verdict = "caught" if rc != 0 else "silent"
+            print(f"  {'ok' if ok else 'WRONG':>5}  {label} -> rc={rc} ({verdict})")
+
+    return problems
+
+
+def run_case(case: Case) -> str | None:
+    """Run one case; return a problem string, or None if it behaved."""
+    with tempfile.TemporaryDirectory(prefix="docs-teeth-") as tmp:
+        workdir = Path(tmp)
+        marker = workdir / NO_SIDE_EFFECT
+        if case.marker and "{marker}" not in case.markdown:
+            return "the case declared a marker but its README does not use one"
+        markdown = (
+            case.markdown.replace("{marker}", str(marker))
+            if case.marker
+            else case.markdown
+        )
+        rc, output = run_gate(markdown, workdir)
+        problems: list[str] = []
+        if "Traceback (most recent call last)" in output:
+            # Rule 1. A crash must never be allowed to score as a detection.
+            problems.append("the gate crashed instead of reaching a verdict")
+        elif not any(marker_text in output for marker_text in VERDICT_MARKERS):
+            problems.append("the gate produced no recognisable verdict")
+        if rc != case.expect_rc:
+            problems.append(f"expected exit {case.expect_rc}, got {rc}")
+        if case.expect and case.expect not in output:
+            problems.append(f"expected {case.expect!r} in the output")
+        # The marker lives beside the synthetic README, not inside the gate's
+        # own scratch directory, so if a substitution ran, the file is still here.
+        leftovers = [str(p.relative_to(workdir)) for p in workdir.rglob(NO_SIDE_EFFECT)]
+        if leftovers:
+            problems.append(
+                f"command substitution ran anyway and created {leftovers}"
+            )
+        return "; ".join(problems) or None
+
+
+def main() -> int:
+    if not CHECK.is_file():
+        print(f"error: {CHECK} not found", file=sys.stderr)
+        return 2
+
+    # No preflight check on how toxindb was installed. An earlier version
+    # printed a note when an environment variable was unset, which read as
+    # though the variable controlled something; it controlled nothing. The
+    # situation is covered without one: the gate under test refuses to run
+    # against an editable install of the checkout and exits 2, so every case
+    # that expects 1 or 0 fails with "expected exit N, got 2" and names the
+    # configuration. That is a louder and more accurate outcome than a note.
+
+    problems: list[str] = []
+    total = 0
+
+    for heading, cases in (
+        ("MUST FAIL (documented commands)", MUST_FAIL),
+        ("MUST FAIL (document structure)", STRUCTURAL),
+        ("MUST PASS (the gate must accept a good README)", MUST_PASS),
+    ):
+        print(f"\n{heading}:")
+        for case in cases:
+            total += 1
+            problem = run_case(case)
+            if problem is None:
+                print(f"  ok     {case.title}")
+            else:
+                problems.append(f"{case.title}: {problem}")
+                print(f"  WRONG  {case.title} -> {problem}")
+
+    print(
+        "\nWorking-tree assertion -- called directly, because `run_case` hands "
+        "the gate a scratch directory with no `.git`, so all "
+        f"{total} cases above run with this assertion legitimately skipped:"
+    )
+    try:
+        problems.extend(check_tree_state())
+    except MutationFailed as exc:
+        problems.append(f"the working-tree assertion could not be checked: {exc}")
+
+    print(
+        "\nWorking-tree verdict -- driven end to end against a scratch "
+        "checkout, because calling `_tree_state` proves the snapshot works, "
+        "not that a dirty tree fails:"
+    )
+    try:
+        problems.extend(check_tree_verdict())
+    except MutationFailed as exc:
+        problems.append(f"the working-tree verdict could not be checked: {exc}")
+
+    print()
+    if problems:
+        print(
+            f"::error::the docs gate is not trustworthy ({len(problems)} problem(s)):"
+        )
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    # Counted, not assumed. The previous version printed
+    # `len(MUST_FAIL) + len(STRUCTURAL)` under the words "rejected", which
+    # counted every case in both lists as a rejection even though several
+    # STRUCTURAL cases expect exit 0, because the gate is *supposed* to accept
+    # those documents. They are real cases and worth running -- a rule that
+    # rejects a well-formed document is just as broken as one that misses a
+    # defect -- but calling them "rejected" claims evidence that does not exist,
+    # in the one line a reader is most likely to quote when auditing what this
+    # gate proved.
+    #
+    # No percentage is quoted here. An earlier version of this comment gave
+    # "17%" and "four", which went stale the moment this round added a case --
+    # the same drift the count itself exists to prevent, one paragraph up.
+    rejected = sum(1 for case in (*MUST_FAIL, *STRUCTURAL) if case.expect_rc != 0)
+    accepted_defects = len(MUST_FAIL) + len(STRUCTURAL) - rejected
+    print(
+        f"The docs gate rejected {rejected} injected document defects, "
+        f"correctly accepted {accepted_defects} well-formed document(s) it must "
+        f"not reject, accepted {len(MUST_PASS)} good README(s), executed no "
+        f"command substitution, saw a real tree change and refused a broken git "
+        f"instead of skipping on it, failed a run whose documented command wrote "
+        f"into the checkout and went quiet once that assertion was disarmed, and "
+        f"did not confuse a crash with a verdict."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

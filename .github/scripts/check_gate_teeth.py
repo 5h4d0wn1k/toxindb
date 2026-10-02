@@ -1,0 +1,1356 @@
+#!/usr/bin/env python3
+"""Prove that check_demo_determinism.py can actually fail.
+
+A CI gate nobody has watched reject bad input is not a gate -- it is a green
+light wired to nothing. This script injects known defects and asserts that the
+determinism check notices each one.
+
+Four rules make this a test rather than a demonstration
+--------------------------------------------------------
+
+1. **A crash is not a detection.** Every MUST_FAIL case must make the check
+   report a *difference*, not merely exit non-zero. A mutation that breaks the
+   program so badly the demo dies would otherwise score as a pass, which is
+   theatre rather than evidence. An earlier version of this script made exactly
+   that mistake on four of five cases: ``NameError``, ``AttributeError`` and
+   ``IndentationError`` all produce rc=1, which the check counted as success.
+   The CONTROL case keeps this distinction live.
+
+2. **Every anchor is unambiguous.** Each mutation not only asserts its anchor
+   exists but asserts the anchor is *unique where it is being replaced*. Two
+   helpers do this, for two scopes. ``_replace_in_class`` requires the anchor to
+   occur exactly once inside one named detector, which is what makes
+   ``doc_ids=recent_docs,`` -- present twice in ``heuristics.py``, once in TX-001
+   and once in TX-002 -- safe: a plain first-match replacement would silently
+   retarget the case at whichever detector came first in the file, and
+   reordering two unrelated classes is a purely cosmetic change that would have
+   turned the TX-001 case into a TX-002 case still printed as "TX-001".
+   ``_replace`` requires the anchor to occur exactly once in the whole file.
+   It used to test "at least once" and replace the first match, so a duplicate
+   introduced by an unrelated refactor moved the mutation without moving the
+   label; seven of the eleven MUST_FAIL cases go through it, and that was the
+   majority of the file with no uniqueness check at all.
+
+3. **The cases that can name an output file do; the rest do not.** This rule was
+   previously written as if all eleven MUST_FAIL cases named the output file
+   whose contents must change, and as though enforcement were universal. It is
+   not: ``Case.expect`` is optional, and only two cases use it. Those two are
+   the ones where being "carried entirely by one renderer" was demonstrated
+   rather than imagined -- the TX-001 case still passed when the normaliser was
+   widened to sort every heuristic's doc_ids, because only the Markdown differed,
+   and naming ``demo_poison_alerts.jsonl`` is what turned that into a red.
+
+   The other nine assert only the exit status, which is a weaker claim than this
+   rule implies. A future case whose *subject* is a renderer-level detail should
+   name its output file; one whose subject is "the demo produced no usable
+   output" has no such file to name, because there is no output. Left stated
+   accurately rather than left as a promise the code does not keep.
+
+4. **The normalisations are proven narrow.** Each MUST_PASS case injects
+   something the check is documented to absorb and requires it to stay green;
+   each MUST_FAIL case injects something that *looks* similar but is not, and
+   requires it to be caught. Without both directions, a normaliser that
+   swallowed everything would satisfy every MUST_FAIL case vacuously.
+
+Why some cases call the normaliser directly
+--------------------------------------------
+The check absorbs varying ``doc_ids`` order for TX-008. Proving that end-to-end
+means making the order differ between two separate demo runs, and any mechanism
+for doing that has a failure mode:
+
+* ``list(set(...))`` -- the shipped defect -- agrees across two runs about half
+  the time, because TX-008's overlap holds two elements and there are only two
+  possible orders.
+* a random choice -- same problem, one bit of entropy per run.
+* a counter file -- correct in principle, but the parity shift breaks if a run
+  makes an even number of calls.
+
+So the *scope* of the doc_ids normalisation is verified directly, by calling
+``canonical_bytes()`` on two records that differ only in that order. That is
+exact, instant, and cannot flake.
+
+End-to-end evidence that varying doc order in a *non*-normalised detector is
+caught comes from the TX-001 case, whose overlap holds three or four ids in the
+poison fixture. That case used to be reliable by luck: it drew a fresh random
+ordering per call, and if all 13 draws happened to match between the two runs
+the check correctly reported that it could not see the difference, which counted
+as a failure of this script. At 1/2 per draw that was 0.0122% per run, and
+0.46% for the appendix case, measured at 5 misses in 1000 runs. Both now derive
+their ordering from ``TOXINDB_DETERMINISM_RUN``, which the determinism check
+exports for exactly this purpose, so the runs are guaranteed to differ.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import shutil
+from fnmatch import fnmatch
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CHECK = HERE / "check_demo_determinism.py"
+REPO = HERE.parent.parent
+
+# Names skipped at any depth. Byte-code caches are produced by importing, so they
+# turn up under every package, and `*.egg-info` is generated by a build.
+_SKIP_ANYWHERE: tuple[str, ...] = (
+    "__pycache__",
+    "*.pyc",
+    "*.egg-info",
+)
+
+# Names skipped only at the repository root: build output, caches, and
+# virtualenvs. The venv patterns are broad on purpose -- matching only the exact
+# names `.venv`, `venv` and `env` means a contributor who calls theirs
+# `.venv311` pays for eight copies of a 30 MB directory on every run.
+_SKIP_AT_ROOT: tuple[str, ...] = (
+    ".git",
+    ".venv*",
+    "venv*",
+    "env*",
+    ".tox",
+    "dist",
+    "build",
+    "reports",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".coverage",
+    "htmlcov",
+    "*.log",
+)
+
+
+def _skip(directory: str, names: list[str]) -> set[str]:
+    """The subset of `names` `copytree` should leave out.
+
+    This was `shutil.ignore_patterns`, which matches every pattern against the
+    *basename* at every depth. So `env*` silently dropped a future
+    `toxindb/env.py` and `build` dropped `toxindb/build_report.py` -- and a file
+    the copy is missing is a false green here, because the mutation is then
+    tested against a package that is not the one being shipped. Copying a file
+    that does not belong is cheap; not copying one that does is not.
+
+    Verified: with `shutil.ignore_patterns`, adding `toxindb/env.py` makes the
+    teeth run test a package without it.
+    """
+    patterns = _SKIP_AT_ROOT + _SKIP_ANYWHERE if Path(directory) == REPO else _SKIP_ANYWHERE
+    return {name for name in names if any(fnmatch(name, p) for p in patterns)}
+
+# Substrings the check prints only when it performed a real comparison and
+# found a difference, as opposed to the demo failing to run. The last one is
+# the "compared nothing" guard: a demo that writes only empty or only
+# unparseable files has produced no result, and saying so is a real verdict.
+DIFF_MARKERS = (
+    "differs between runs",
+    "was produced by run",
+    "no output files in common",
+    "no compared file was non-empty and machine-readable",
+)
+
+# A per-run ordering, injected in place of a detector's doc_ids. The second run
+# gets the ids rotated by one; the first gets them as they are. Same multiset,
+# different order, and the difference is guaranteed rather than probable.
+#
+# This used to be a coin flip per call, which is a real defect: the end-to-end
+# cases can only fail if the two runs *actually* disagree, so a mutation that
+# rolls `random()` has a chance of producing identical output and the gate then
+# correctly reports that the check is blind -- which is itself a failure. For
+# TX-001 that chance was 0.0122% per run (13 draws, 1/2 each), and for the
+# appendix 0.46% (3 draws from 6 orders), measured at 5 misses in 1000 runs. A
+# gate that fails intermittently for its own reasons is a gate nobody trusts, so
+# the ordering is derived from `TOXINDB_DETERMINISM_RUN` instead: the
+# determinism check exports which run it is, and the difference is then
+# certain instead of merely likely.
+RUN_INDEXED_ORDER = (
+    "(list({var})[1:] + list({var})[:1]"
+    " if __import__('os').environ.get('TOXINDB_DETERMINISM_RUN') == '2'"
+    " else list({var}))"
+)
+
+# The same trick for a run-varying literal in a Markdown appendix. Run 1 emits
+# one order, run 2 the reverse.
+RUN_INDEXED_IDS = (
+    "['zz-9', 'zz-8', 'zz-7']"
+    " if __import__('os').environ.get('TOXINDB_DETERMINISM_RUN') != '2'"
+    " else ['zz-7', 'zz-8', 'zz-9']"
+)
+
+
+class MutationFailed(Exception):
+    """Raised when a mutation's anchor is missing or ambiguous."""
+
+
+def _replace(path: Path, old: str, new: str, count: int = 1) -> None:
+    text = path.read_text(encoding="utf-8")
+    found = text.count(old)
+    if found != count:
+        # Exactly, not "at least". Rule 2 in the module docstring promises every
+        # anchor is unambiguous, and this function did not keep that promise: it
+        # tested `found < count` and replaced the first match, so a second copy
+        # of the anchor added by an unrelated refactor silently retargeted the
+        # mutation and the case kept printing the name it was written with.
+        # Seven of the eleven MUST_FAIL mutations come through here rather than
+        # `_replace_in_class`, which asserted uniqueness all along. (Counted, not
+        # estimated: an earlier draft of this comment said "eight of the eleven",
+        # carried over from a review note rather than checked.)
+        raise MutationFailed(
+            f"anchor occurs {found} time(s) in {path.name}, expected exactly "
+            f"{count}: {old!r}"
+        )
+    path.write_text(text.replace(old, new, count), encoding="utf-8")
+
+
+def _class_slice(text: str, class_name: str) -> tuple[int, int]:
+    """Return the [start, end) offsets of a top-level class body."""
+    marker = f"\nclass {class_name}"
+    start = text.find(marker)
+    if start == -1:
+        raise MutationFailed(f"class not found: {class_name}")
+    start += 1  # keep the leading newline
+    following = text.find("\nclass ", start + 1)
+    end = len(text) if following == -1 else following
+    return start, end
+
+
+def _replace_in_class(
+    path: Path, class_name: str, old: str, new: str, expect: int = 1
+) -> None:
+    """Replace `old` only inside `class_name`, asserting it is unambiguous there.
+
+    Without the uniqueness assertion, reordering two classes in the file would
+    silently move a mutation from one detector to another and the case would
+    keep reporting the name it was written with.
+    """
+    text = path.read_text(encoding="utf-8")
+    start, end = _class_slice(text, class_name)
+    body = text[start:end]
+    found = body.count(old)
+    if found != expect:
+        raise MutationFailed(
+            f"anchor {old!r} occurs {found} time(s) inside {class_name}, "
+            f"expected exactly {expect}"
+        )
+    text = text[:start] + body.replace(old, new, expect) + text[end:]
+    path.write_text(text, encoding="utf-8")
+
+
+def _fresh_repo() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="teeth-src-"))
+    target = root / "repo"
+    shutil.copytree(REPO, target, ignore=_skip)
+    return target
+
+
+# --------------------------------------------------------------------------
+# MUST FAIL (end to end) -- each must be reported as a real difference.
+# --------------------------------------------------------------------------
+
+_HEURISTICS = ("toxindb", "heuristics.py")
+
+
+def m_random_value_in_alert_detail(repo: Path) -> None:
+    """A per-call clock reading embedded in an alert's detail string.
+
+    The most realistic shape of this bug: someone adds "generated at" or a
+    duration to a message without realising it makes the report irreproducible.
+    """
+    _replace_in_class(
+        repo.joinpath(*_HEURISTICS),
+        "DemandConcentrationDetector",
+        'f"{recent_count}/{total} retrievals (',
+        'f"n={__import__(\'time\').time_ns()} {recent_count}/{total} retrievals (',
+    )
+
+
+def m_random_tx001_doc_order(repo: Path) -> None:
+    """TX-001 emits its doc_ids in a different order on each run.
+
+    The mirror image of the TX-008 normalisation, and it must be CAUGHT.
+    Sorting every detector's doc_ids would hide any future ordering bug in any
+    heuristic, so the normalisation is scoped to TX-008 and this proves it.
+
+    The order is a rotation keyed on the run index rather than a coin flip, so
+    the two runs are guaranteed to disagree; see `RUN_INDEXED_ORDER`. Rotating is
+    only a change when the overlap holds two or more distinct ids, and TX-001's
+    does -- the alerts in the poison fixture carry three and four.
+
+    The anchor `doc_ids=recent_docs,` also appears in TX-002, so the
+    replacement is scoped to the class and asserted unique within it.
+    """
+    _replace_in_class(
+        repo.joinpath(*_HEURISTICS),
+        "DemandConcentrationDetector",
+        "doc_ids=recent_docs,",
+        f"doc_ids={RUN_INDEXED_ORDER.format(var='recent_docs')},",
+    )
+
+
+def m_new_volatile_report_field(repo: Path) -> None:
+    """A brand-new per-run field in the JSON report.
+
+    The check removes exactly one key, by name, from the top level. It must not
+    be generalised into "drop anything that looks like a timestamp", or a
+    genuinely volatile new field would be absorbed silently.
+    """
+    _replace(
+        repo / "toxindb" / "report.py",
+        '"generated_at": datetime.now(timezone.utc).isoformat(),',
+        '"generated_at": datetime.now(timezone.utc).isoformat(),\n'
+        '        "build_nonce": __import__("time").time_ns(),',
+    )
+
+
+def m_generated_at_inside_an_alert(repo: Path) -> None:
+    """A detector grows its own `generated_at` field.
+
+    The key is report metadata only because it is not detector output. Once a
+    detector emits it, the value is per-call and must be compared. The check
+    removes the key from the top level of a report document, not at any depth,
+    so this must be caught in both the JSON report and the alerts JSONL.
+    """
+    _replace_in_class(
+        repo.joinpath(*_HEURISTICS),
+        "Alert",
+        '"severity": self.severity,',
+        '"severity": self.severity,\n'
+        '            "generated_at": __import__("time").time_ns(),',
+    )
+
+
+def m_generated_line_after_a_heading(repo: Path) -> None:
+    """A `**Generated:**` line emitted as *detection data*, below the header.
+
+    The check drops that line only from a report's header -- before the first
+    heading. Anywhere else it is content, and dropping it would hide a real
+    per-run value.
+    """
+    _replace(
+        repo / "toxindb" / "report.py",
+        "lines.append(\"\")\n    return \"\\n\".join(lines)",
+        "lines.append(\"\")\n"
+        "    lines.append(\"- **Generated:** \" + str(__import__('time').time_ns()))\n"
+        "    return \"\\n\".join(lines)",
+    )
+
+
+def m_appendix_after_tx008(repo: Path) -> None:
+    """Run-varying document ordering in a section that *follows* TX-008.
+
+    The Markdown normalisation is scoped to the `### TX-008` section and any
+    heading closes it. Without that, `section` latches onto TX-008 for the rest
+    of the document and every later `**Documents:**` line gets silently sorted.
+
+    The ordering is keyed on the run index, not drawn with `random.sample`, so
+    the two runs are guaranteed to disagree; see `RUN_INDEXED_IDS`.
+    """
+    _replace(
+        repo / "toxindb" / "report.py",
+        "lines.append(\"\")\n    return \"\\n\".join(lines)",
+        "lines.append(\"\")\n"
+        "    lines.append(\"## Appendix\")\n"
+        "    lines.append(\"- **Documents:** `\" + "
+        f"','.join({RUN_INDEXED_IDS}) + \"`\")\n"
+        "    return \"\\n\".join(lines)",
+    )
+
+
+def m_extra_output_file(repo: Path) -> None:
+    """One run writes a file the other does not."""
+    cli = repo / "toxindb" / "cli.py"
+    helper = (
+        "\ndef _teeth_emit(out_dir):\n"
+        "    import os, secrets\n"
+        "    name = os.path.join(out_dir, 'teeth-%s.txt' % secrets.token_hex(4))\n"
+        "    with open(name, 'w') as fh:\n"
+        "        fh.write('x')\n"
+        "\n"
+    )
+    anchor = (
+        "    output_dir = args.output\n"
+        "    os.makedirs(output_dir, exist_ok=True)\n"
+        "\n"
+        "    results = {}\n"
+    )
+    # Both anchors must be *unique*, not merely present. This function used to
+    # check `needle in text` and then `replace(..., 1)`, so a second copy of
+    # either block introduced by an unrelated refactor moved the mutation
+    # somewhere else while the case kept printing this title -- which is the
+    # scenario Rule 2 documents as prevented. It fails loudly rather than
+    # silently, so the cost was a misleading label, not a false green.
+    for needle in ("def cmd_demo", anchor):
+        if cli.read_text(encoding="utf-8").count(needle) != 1:
+            raise MutationFailed(
+                f"anchor occurs {cli.read_text(encoding='utf-8').count(needle)} "
+                f"time(s) in cli.py, expected exactly 1: {needle!r}"
+            )
+    text = cli.read_text(encoding="utf-8")
+    text = text.replace("def cmd_demo", helper + "def cmd_demo", 1)
+    text = text.replace(anchor, anchor + "\n    _teeth_emit(output_dir)\n", 1)
+    cli.write_text(text, encoding="utf-8")
+
+
+def m_demo_writes_nothing(repo: Path) -> None:
+    """The demo runs, exits 0, and writes no files at all.
+
+    Comparing zero files would otherwise be reported as determinism.
+    """
+    _replace(
+        repo / "toxindb" / "cli.py",
+        'def cmd_demo(args) -> int:\n    print("=== toxindb demo ===")',
+        'def cmd_demo(args) -> int:\n'
+        '    print("=== toxindb demo ===")\n'
+        "    return 0",
+    )
+
+
+def m_demo_writes_only_empty_files(repo: Path) -> None:
+    """The demo writes one file per run and it is always empty.
+
+    The zero-*files* case is caught by "no output files in common". This is the
+    zero-*content* analogue: one file exists, so the comparison runs, and two
+    empty files compare equal. Mutated at the point where the output directory
+    is created, so the demo still exits 0 -- the rest of the body becomes
+    unreachable rather than undefined.
+
+    The guard for this is the same one that catches
+    ``m_demo_writes_only_unparseable_reports``; the two cases are here because a
+    guard that only handles one of them is a guard that will be re-broken.
+    """
+    cli = repo / "toxindb" / "cli.py"
+    _replace(
+        cli,
+        "    output_dir = args.output\n"
+        "    os.makedirs(output_dir, exist_ok=True)\n"
+        "\n"
+        "    results = {}\n",
+        "    output_dir = args.output\n"
+        "    os.makedirs(output_dir, exist_ok=True)\n"
+        "    open(os.path.join(output_dir, 'teeth-empty.txt'), 'w').close()\n"
+        "    return 0\n"
+        "\n"
+        "    results = {}\n",
+    )
+
+
+def m_demo_writes_only_unparseable_reports(repo: Path) -> None:
+    """The demo writes one report per run, and it is never valid JSON.
+
+    The second shape of the zero-*content* case, and the one the guard used to
+    miss. Two empty files are caught by a count of empty files, but
+    ``{not json`` is neither empty nor parseable, so a guard that only counts
+    zero-byte files reported this run as deterministic -- on output that proves
+    nothing at all. The file is non-empty and identical on every run, so every
+    earlier check passed it.
+    """
+    _replace(
+        repo / "toxindb" / "cli.py",
+        "    output_dir = args.output\n"
+        "    os.makedirs(output_dir, exist_ok=True)\n"
+        "\n"
+        "    results = {}\n",
+        "    output_dir = args.output\n"
+        "    os.makedirs(output_dir, exist_ok=True)\n"
+        "    with open(os.path.join(output_dir, 'teeth-broken.json'), 'w') as _fh:\n"
+        "        _fh.write('{not json')\n"
+        "    return 0\n"
+        "\n"
+        "    results = {}\n",
+    )
+
+
+def m_volatile_suffix_on_documents_line(repo: Path) -> None:
+    """A volatile suffix appended to a Markdown ``**Documents:**`` line.
+
+    The normaliser reorders a *pure* id list and leaves anything else alone.
+    If it sorted ids inside a line that also carries other text, it would be
+    guessing where the list ends -- so this must be caught, not absorbed.
+    """
+    _replace(
+        repo / "toxindb" / "report.py",
+        "**Documents:**",
+        "**Documents:** (nonce {__import__('time').time_ns()})",
+    )
+
+
+# --------------------------------------------------------------------------
+# MUST PASS (end to end) -- documented as absorbed, so the check stays green.
+# --------------------------------------------------------------------------
+
+
+def m_microsecond_report_timestamp(repo: Path) -> None:
+    """Report metadata raised to microsecond resolution.
+
+    The JSON report's ``generated_at`` is built with ``datetime.isoformat()``,
+    which carries microseconds, so the two runs the check makes already differ
+    here and the timestamp normalisation is load-bearing rather than
+    decorative. The Markdown ``**Generated:**`` line is the opposite: it is
+    formatted with ``%Y-%m-%dT%H:%M:%SZ``, so it has second granularity and two
+    runs inside one second are byte-identical anyway.
+
+    This mutation raises the *JSON* value's explicit format to microseconds as
+    well, so the case is not resting on the default. An earlier version of this
+    docstring claimed it removed that dependence; it did not, because the
+    default already had microseconds.
+    """
+    _replace(
+        repo / "toxindb" / "report.py",
+        '"generated_at": datetime.now(timezone.utc).isoformat(),',
+        '"generated_at": datetime.now(timezone.utc)'
+        '.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),',
+    )
+
+
+# --------------------------------------------------------------------------
+# Scope of the normalisations, verified directly and deterministically.
+# --------------------------------------------------------------------------
+
+
+def _load_check_module():
+    spec = importlib.util.spec_from_file_location("toxindb_determinism", CHECK)
+    assert spec and spec.loader, "could not load the determinism check"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _alert(heuristic_id: str, doc_ids: list[str], **extra) -> dict:
+    payload = {
+        "heuristic_id": heuristic_id,
+        "heuristic_name": "x",
+        "severity": "high",
+        "query_id": None,
+        "doc_ids": doc_ids,
+        "detail": "d",
+        "confidence": 1.0,
+    }
+    payload.update(extra)
+    return payload
+
+
+def _j(obj) -> bytes:
+    return json.dumps(obj).encode("utf-8")
+
+
+# Names a future contributor might plausibly add to a "drop the volatile stuff"
+# allowlist. Only `generated_at` may be absorbed; every one of these is a real
+# detection result and must be compared. Parameterising the list matters: a
+# single hard-coded probe name leaves the teeth gate fully green when the
+# allowlist is quietly widened, which is the exact failure the case exists for.
+#
+# These eight all exercise the *same* code path -- one extra top-level JSON key
+# compared by name. They are eight data points, not eight mechanisms, and the
+# summary line below says so rather than implying otherwise.
+VOLATILE_LOOKING_NAMES = (
+    "timestamp",
+    "created_at",
+    "run_id",
+    "started_at",
+    "executed_at",
+    "build_nonce",
+    "ts",
+    "as_of",
+)
+
+
+def scope_cases() -> list[tuple[str, bytes, bytes, str, bool]]:
+    cases: list[tuple[str, bytes, bytes, str, bool]] = [
+        # -- metadata: absorbed only at the top level of a JSON report --------
+        (
+            "top-level generated_at is absorbed",
+            _j({"generated_at": "2024-01-01T00:00:00+00:00", "alert_count": 1}),
+            _j({"generated_at": "2025-09-09T09:09:09+00:00", "alert_count": 1}),
+            ".json",
+            True,
+        ),
+        (
+            "generated_at nested in a report is NOT absorbed",
+            _j({"a": {"b": {"generated_at": "x"}}}),
+            _j({"a": {"b": {"generated_at": "y"}}}),
+            ".json",
+            False,
+        ),
+        (
+            "generated_at inside an alert record is NOT absorbed",
+            _j(_alert("TX-001", ["a"], generated_at="x")),
+            _j(_alert("TX-001", ["a"], generated_at="y")),
+            ".jsonl",
+            False,
+        ),
+        # -- metadata: absorbed only from a Markdown header -------------------
+        (
+            "the Generated header line is absorbed",
+            b"# Report\n\n**Generated:** 2024-01-01T00:00:00Z\n\n## Summary\n\n- a: 1\n",
+            b"# Report\n\n**Generated:** 2025-09-09T09:09:09Z\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        (
+            "the Generated header line is absorbed as a list item",
+            b"# Report\n\n- **Generated:** 2024-01-01T00:00:00Z\n\n## Summary\n\n- a: 1\n",
+            b"# Report\n\n- **Generated:** 2025-09-09T09:09:09Z\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        # Two cases above had no title and no section heading at all, and were
+        # absorbed because a document with no headings was treated as being all
+        # preamble -- so the *whole* document was metadata and a `**Generated:**`
+        # line anywhere in it was dropped. That is the false negative a
+        # determinism gate exists to prevent: a per-run timestamp buried in the
+        # body would make two different runs compare equal and be reported as
+        # deterministic. The rule is now that a preamble has to be identifiable,
+        # i.e. the document needs a section heading after its title. These two
+        # cases are the shape the rule refuses, and they fail if it is relaxed
+        # back to `len(lines)`.
+        (
+            "a Generated line in a title-only document is NOT absorbed",
+            b"# Report\n\n**Generated:** 2024\n\n- a: 1\n",
+            b"# Report\n\n**Generated:** 2025\n\n- a: 1\n",
+            ".md",
+            False,
+        ),
+        (
+            "a Generated line in a setext-titled document is NOT absorbed",
+            b"Report\n======\n\n**Generated:** 2024\n\n- a: 1\n",
+            b"Report\n======\n\n**Generated:** 2025\n\n- a: 1\n",
+            ".md",
+            False,
+        ),
+        (
+            "a Generated line in a headingless document is NOT absorbed",
+            b"**Generated:** 2024\n\n- a: 1\n",
+            b"**Generated:** 2025\n\n- a: 1\n",
+            ".md",
+            False,
+        ),
+        (
+            "a Generated line BELOW a heading is NOT absorbed",
+            b"## Alerts\n\n- **Generated:** 2024\n",
+            b"## Alerts\n\n- **Generated:** 2025\n",
+            ".md",
+            False,
+        ),
+        # A `---` on the line after a heading is a thematic break, not a setext
+        # H2 underline, so it must not end the preamble one line early. The
+        # previous rule matched the underline without asking what preceded it,
+        # so `# Title` / `---` made the break a heading at index 1 and left a real
+        # report's `**Generated:**` line to be compared literally -- a spurious
+        # red on a timestamp that genuinely differs between two runs.
+        (
+            "a --- break after an ATX title does not end the preamble early",
+            b"# Title\n---\n**Generated:** 2024\n\n## Summary\n\n- a: 1\n",
+            b"# Title\n---\n**Generated:** 2025\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        # Same, after a *setext* title. Checking only ATX headings would leave
+        # this one misparsed, because a setext heading's last line is its
+        # underline rather than a `#` line.
+        (
+            "a --- break after a setext title does not end the preamble early",
+            b"Title\n=====\n---\n\n**Generated:** 2024\n\n## Summary\n\n- a: 1\n",
+            b"Title\n=====\n---\n\n**Generated:** 2025\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        # A heading quoted inside a fence is part of the report body, not a
+        # section. Treating it as one closed the preamble at the fence and left
+        # every real section after it invisible.
+        (
+            "a heading inside a fence does not end the preamble",
+            b"# Title\n\n```\n## not a heading\n```\n**Generated:** 2024\n\n## Summary\n\n- a: 1\n",
+            b"# Title\n\n```\n## not a heading\n```\n**Generated:** 2025\n\n## Summary\n\n- a: 1\n",
+            ".md",
+            True,
+        ),
+        # The other direction, and the reason the fix above is not a blanket
+        # relaxation: a real setext H2 in the body is still a section, so a
+        # `**Generated:**` line after it is body text and must be compared.
+        (
+            "a real setext H2 still ends the preamble",
+            b"Title\n=====\n\nIntro\n---\n\n**Generated:** 2024\n",
+            b"Title\n=====\n\nIntro\n---\n\n**Generated:** 2025\n",
+            ".md",
+            False,
+        ),
+        (
+            "the italic footer is NOT treated as metadata",
+            b"*Generated by toxindb - detector*\n",
+            b"*Generated by toxindb - scanner*\n",
+            ".md",
+            False,
+        ),
+        # -- doc_ids ordering: TX-008 only ------------------------------------
+        (
+            "TX-008 doc_ids order is absorbed (issue #22)",
+            _j(_alert("TX-008", ["b", "a"])),
+            _j(_alert("TX-008", ["a", "b"])),
+            ".jsonl",
+            True,
+        ),
+        (
+            "TX-001 doc_ids order is NOT absorbed",
+            _j(_alert("TX-001", ["b", "a"])),
+            _j(_alert("TX-001", ["a", "b"])),
+            ".jsonl",
+            False,
+        ),
+        (
+            "lowercase tx-008 is NOT treated as TX-008",
+            _j(_alert("tx-008", ["b", "a"])),
+            _j(_alert("tx-008", ["a", "b"])),
+            ".jsonl",
+            False,
+        ),
+        (
+            "'TX-008 ' with a trailing space is NOT treated as TX-008",
+            _j(_alert("TX-008 ", ["b", "a"])),
+            _j(_alert("TX-008 ", ["a", "b"])),
+            ".jsonl",
+            False,
+        ),
+        (
+            "a different doc_ids multiset is NOT absorbed",
+            _j(_alert("TX-008", ["a", "b"])),
+            _j(_alert("TX-008", ["b", "b", "a"])),
+            ".jsonl",
+            False,
+        ),
+        # -- Markdown section scoping -----------------------------------------
+        (
+            "TX-008 Documents order is absorbed",
+            b"### TX-008: LangChain\n\n- **Documents:** `b`, `a`\n",
+            b"### TX-008: LangChain\n\n- **Documents:** `a`, `b`\n",
+            ".md",
+            True,
+        ),
+        (
+            "TX-001 Documents order is NOT absorbed",
+            b"### TX-001: Demand\n\n- **Documents:** `b`, `a`\n",
+            b"### TX-001: Demand\n\n- **Documents:** `a`, `b`\n",
+            ".md",
+            False,
+        ),
+        (
+            "any heading closes the TX-008 section",
+            b"### TX-008: L\n\n## Appendix\n\n- **Documents:** `b`, `a`\n",
+            b"### TX-008: L\n\n## Appendix\n\n- **Documents:** `a`, `b`\n",
+            ".md",
+            False,
+        ),
+        (
+            "a non-id-list Documents line is left alone",
+            b"### TX-008: L\n\n- **Documents:** `b`, `a` (2 of 9)\n",
+            b"### TX-008: L\n\n- **Documents:** `b`, `a` (3 of 9)\n",
+            ".md",
+            False,
+        ),
+        # -- everything else ---------------------------------------------------
+        (
+            "severity is not absorbed",
+            _j(_alert("TX-008", ["a"]) | {"severity": "high"}),
+            _j(_alert("TX-008", ["a"]) | {"severity": "low"}),
+            ".json",
+            False,
+        ),
+        (
+            "confidence is not absorbed",
+            _j(_alert("TX-008", ["a"]) | {"confidence": 0.5}),
+            _j(_alert("TX-008", ["a"]) | {"confidence": 0.9}),
+            ".json",
+            False,
+        ),
+        (
+            "a compact JSON report is compared, not skipped",
+            _j({"generated_at": "x", "alert_count": 2, "alerts": []}),
+            _j({"generated_at": "y", "alert_count": 3, "alerts": []}),
+            ".json",
+            False,
+        ),
+        (
+            "a .txt sidecar is never markdown-normalised",
+            b"### TX-008: L\n\n- **Documents:** `b`, `a`\n",
+            b"### TX-008: L\n\n- **Documents:** `a`, `b`\n",
+            ".txt",
+            False,
+        ),
+        (
+            "differing non-UTF-8 bytes are detected, not lossy-decoded",
+            b"id\xff payload",
+            b"id\xfe payload",
+            ".txt",
+            False,
+        ),
+        (
+            "identical non-UTF-8 bytes compare equal",
+            b"id\xff payload",
+            b"id\xff payload",
+            ".txt",
+            True,
+        ),
+        (
+            "unparseable JSON falls back to a raw comparison",
+            b"{not json",
+            b"{also not json",
+            ".json",
+            False,
+        ),
+    ]
+    for name in VOLATILE_LOOKING_NAMES:
+        cases.append(
+            (
+                f"volatile-looking key {name!r} is NOT absorbed",
+                _j({"alert_count": 1, name: "x"}),
+                _j({"alert_count": 1, name: "y"}),
+                ".json",
+                False,
+            )
+        )
+    return cases
+
+
+def check_normaliser_scope() -> list[str]:
+    """Verify the normaliser absorbs exactly what it documents."""
+    module = _load_check_module()
+    problems: list[str] = []
+    for label, first, second, suffix, expect_identical in scope_cases():
+        identical = (
+            module.canonical_bytes(first, suffix) == module.canonical_bytes(second, suffix)
+        )
+        if identical == expect_identical:
+            print(f"  ok     {label}")
+            continue
+        problems.append(
+            f"{label}: expected {'absorbed' if expect_identical else 'detected'}, "
+            f"got {'absorbed' if identical else 'detected'}"
+        )
+        print(f"  WRONG  {label}")
+    return problems
+
+
+# --------------------------------------------------------------------------
+# CONTROL -- a crash must not be mistaken for a detection.
+# --------------------------------------------------------------------------
+
+
+def m_deterministic_crash(repo: Path) -> None:
+    """The demo dies immediately and identically, every run.
+
+    If the check could not tell this apart from a detected difference, it could
+    not tell whether any other case is a real detection either.
+    """
+    _replace(
+        repo / "toxindb" / "cli.py",
+        "def cmd_demo(args) -> int:",
+        "def cmd_demo(args) -> int:\n    raise SystemExit(3)\n\n"
+        "def _cmd_demo_unused(args) -> int:",
+    )
+
+
+class Case:
+    __slots__ = ("title", "fn", "expect")
+
+    def __init__(self, title: str, fn, expect: str | None = None):
+        self.title = title
+        self.fn = fn
+        self.expect = expect
+
+
+# --------------------------------------------------------------------------
+# The working-tree safety net
+# --------------------------------------------------------------------------
+#
+# The end-to-end cases above copy the tree *without* `.git`, because a copy of
+# the checkout is what lets a mutation perturb the run rather than the
+# repository. That means none of them can show whether the tree assertion works.
+#
+# An earlier version of this comment said the assertion was "legitimately
+# skipped" for those cases, which was false and flattered the check that
+# follows. It was not skipped -- it was *aimed at the wrong tree*. The cases
+# call `run_check(repo)`, which runs this repository's own gate script, and the
+# gate resolves its root from `__file__`, so the comparison snapshotted the
+# original checkout while every write landed in the copy. Verified: no skip note
+# is printed, and the tree error never appears, on a run whose copy is a real
+# checkout containing an injected write. The assertion was live and blind.
+#
+# That is why the checks below pass the *copy's* script explicitly.
+#
+# It matters because the demo resolves its fixtures through the *package*
+# directory, so a change that writes into the checkout is the exact failure the
+# assertion exists to catch -- and the docstring on that assertion claims it was
+# verified. Claim was not evidence: neutralising the comparison left this whole
+# script green.
+#
+# So it gets its own check, against a real `git init` checkout, and it is
+# asserted in both directions. Injecting a tree write and seeing rc=1 proves
+# little on its own -- the mutation could be breaking the demo for some other
+# reason and any non-zero exit would score the same. So the same mutation is
+# also applied with the comparison removed, and there it must exit 0. Only the
+# pair pins the red to the assertion.
+
+_TREE_WRITE_ANCHOR = "    output_dir = args.output\n    os.makedirs(output_dir, exist_ok=True)\n"
+_TREE_ASSERTION = "    if before == after:\n        return 0\n"
+
+
+def _inject_write_of(repo: Path, relative: str) -> None:
+    """Make the demo write `relative` (a cwd-relative path) while it runs.
+
+    The write has to happen *during* the run, not before it. A file that already
+    exists when the gate takes its first snapshot is in both snapshots, so the
+    comparison cannot see it -- which is why the byte-code cases below mutate
+    the product code to create their artefacts instead of creating them here.
+    """
+    cli = repo / "toxindb" / "cli.py"
+    write = f"    open({relative!r}, 'w').write('x')\n"
+    _replace(cli, _TREE_WRITE_ANCHOR, _TREE_WRITE_ANCHOR + write)
+
+
+def _inject_tree_write(repo: Path) -> None:
+    _inject_write_of(repo, "TEETH_TREE_WRITE.json")
+
+
+def _neutralise_tree_assertion(repo: Path) -> None:
+    _replace(
+        repo / ".github" / "scripts" / "check_demo_determinism.py",
+        _TREE_ASSERTION,
+        "    return 0  # teeth: tree assertion neutralised\n",
+    )
+
+
+def _git_init(repo: Path) -> list[str]:
+    """Make `repo` a real checkout, or explain why it is not one."""
+    try:
+        proc = subprocess.run(
+            ["git", "init", "-q"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise MutationFailed(f"`git` is not on PATH ({exc}); this check cannot run") from exc
+    if proc.returncode != 0:
+        raise MutationFailed(f"`git init` failed: {proc.stderr.strip()}")
+    return []
+
+
+_FILTER_ANCHOR = (
+    '    return "__pycache__" in path.split("/") or path.endswith(".pyc")\n'
+)
+
+
+def m_filter_off(repo: Path) -> None:
+    """The byte-code filter stops recognising anything at all."""
+    _replace(
+        repo / ".github" / "scripts" / "check_demo_determinism.py",
+        _FILTER_ANCHOR,
+        "    return False\n",
+    )
+
+
+def m_filter_substring(repo: Path) -> None:
+    """The filter matches `__pycache__` anywhere in the path, not per component."""
+    _replace(
+        repo / ".github" / "scripts" / "check_demo_determinism.py",
+        _FILTER_ANCHOR,
+        '    return "__pycache__" in path or path.endswith(".pyc")\n',
+    )
+
+
+# `_is_byte_code_cache` sees a whole `git status --porcelain` line, not a path.
+# `??` is the common prefix; a rename reads `R  old -> new`.
+_BYTE_CODE_PROPERTIES = (
+    ("?? toxindb/__pycache__/cli.cpython-314.pyc\n", True),
+    ("?? __pycache__/cli.pyc\n", True),
+    ("?? probe.pyc\n", True),
+    ('?? "toxindb/__pycache__/a b.pyc"\n', True),
+    ("?? toxindb/report_cache.py\n", False),
+    ("?? toxindb/pyc_tool.py\n", False),
+    ("?? docs/cache-notes.md\n", False),
+    ("?? src/pycache/README.md\n", False),
+    ("?? reports/out.json\n", False),
+    # Not a path component, only a substring of the file name. Deliberately
+    # close to contrived: it exists to separate component matching from
+    # substring matching, and the two disagree nowhere else.
+    ("?? toxindb/__pycache__helper.py\n", False),
+    ("?? toxindb/map__pycache__v2.json\n", False),
+    # A rename is reported as `old -> new`, and the name on disk is the new one.
+    ("R  toxindb/old.py -> toxindb/__pycache__/new.py\n", True),
+    ("R  toxindb/__pycache__/old.py -> toxindb/new.py\n", False),
+    # Short and empty lines must not raise.
+    ("", False),
+    ("??", False),
+)
+
+
+def check_byte_code_filter() -> list[str]:
+    """Prove the byte-code filter, in both directions.
+
+    The filter exists so that a run which imports the package from the checkout
+    -- which `run_check` does, since `python -m toxindb` resolves from `cwd` --
+    does not report its own `__pycache__` as a write into the tree. It had no
+    test at all: `check_tree_assertion` writes at the repo root, so nothing in
+    this suite ever produced a path for the filter to look at, and two plausible
+    regressions passed.
+
+    Both directions matter and only one of them shows up as a red gate:
+
+    * too narrow, and every run of the gate goes red for a non-reason;
+    * too wide, and a genuine write is swallowed -- the tree assertion stops
+      asserting while still printing that it ran.
+
+    So each direction is checked twice. A property table pins the classifier,
+    and an end-to-end pair proves the classifier is load-bearing on the exit
+    code, which is the thing the property table cannot see.
+    """
+    problems: list[str] = []
+
+    # --- the classifier, called directly ---------------------------------
+    spec = importlib.util.spec_from_file_location(
+        "teeth_determinism_gate", REPO / ".github" / "scripts" / "check_demo_determinism.py"
+    )
+    if spec is None or spec.loader is None:
+        return ["could not load check_demo_determinism.py to test its byte-code filter"]
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - an unloadable gate is a failure
+        return [f"could not import check_demo_determinism.py: {exc}"]
+
+    for line, expected in _BYTE_CODE_PROPERTIES:
+        try:
+            actual = module._is_byte_code_cache(line)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"_is_byte_code_cache({line!r}) raised {exc}")
+            continue
+        if actual != expected:
+            problems.append(
+                f"_is_byte_code_cache({line!r}) returned {actual}, expected "
+                f"{expected} ({'must be filtered out' if expected else 'must NOT be filtered out'})"
+            )
+        label = "cache" if expected else "not cache"
+        print(f"  {'ok' if actual == expected else 'WRONG':>5}  "
+              f"{line.strip() or '(empty)'} -> {label}")
+
+    # --- the classifier, load-bearing on the exit code -------------------
+    print("    ...and through the gate's own exit code, both directions:")
+
+    for label, artefact, mutation, want in (
+        (
+            "a byte-code cache is created and not reported as a tree write",
+            None,
+            None,
+            "zero",
+        ),
+        (
+            "and is reported once the filter stops matching",
+            None,
+            m_filter_off,
+            "nonzero",
+        ),
+        (
+            "a file whose name merely contains the prefix is reported",
+            "toxindb/__pycache__helper.py",
+            None,
+            "nonzero",
+        ),
+        (
+            "and is swallowed once the filter matches on substrings",
+            "toxindb/__pycache__helper.py",
+            m_filter_substring,
+            "zero",
+        ),
+    ):
+        repo = _fresh_repo()
+        try:
+            _git_init(repo)
+            if artefact is not None:
+                # Written by the demo *during* the run, so the second snapshot
+                # can see it at all.
+                _inject_write_of(repo, artefact)
+            if mutation is not None:
+                mutation(repo)
+            rc, output = run_check(
+                repo, check=repo / ".github" / "scripts" / "check_demo_determinism.py"
+            )
+            caches = sorted(repo.rglob("*.pyc"))
+        except MutationFailed as exc:
+            problems.append(f"{label}: {exc}")
+            continue
+        finally:
+            shutil.rmtree(repo.parent, ignore_errors=True)
+
+        # The first two cases are only meaningful if the run actually produced
+        # byte-code for the filter to swallow. `run_check` runs
+        # `python -m toxindb` with `cwd` at the checkout, so the import writes
+        # `toxindb/__pycache__/` every time -- verified at ten files, not
+        # assumed, because an empty set here would make the case vacuous.
+        if artefact is None and not caches:
+            problems.append(
+                f"{label}: the run produced no byte-code in the checkout, so "
+                f"the filter had nothing to do and this case proves nothing"
+            )
+
+        caught = rc != 0
+        ok = caught if want == "nonzero" else not caught
+        if not ok:
+            problems.append(
+                f"{label}: the gate exited {rc} "
+                f"(expected {'nonzero' if want == 'nonzero' else '0'}), so the "
+                f"byte-code filter is too "
+                f"{'wide' if mutation is m_filter_substring or mutation is None else 'narrow'}"
+            )
+        elif want == "nonzero" and "modified the working tree" not in output:
+            problems.append(
+                f"{label}: the gate exited {rc} but did not say the tree "
+                f"changed, so something else caught it"
+            )
+        print(f"  {'ok' if ok else 'WRONG':>5}  {label} -> rc={rc}"
+              f"{f' ({len(caches)} byte-code files in the checkout)' if caches else ''}")
+
+    return problems
+
+
+def check_tree_assertion() -> list[str]:
+    """Prove the working-tree comparison is what catches a write into the tree.
+
+    Two runs, one mutation each. The second is the one that makes the first
+    mean something.
+    """
+    problems: list[str] = []
+    for label, neutralise, want in (
+        ("a write into the tree is caught", False, "nonzero"),
+        ("the same write is silent once the comparison is removed", True, "zero"),
+    ):
+        repo = _fresh_repo()
+        try:
+            _git_init(repo)
+            _inject_tree_write(repo)
+            if neutralise:
+                _neutralise_tree_assertion(repo)
+            rc, output = run_check(
+                repo, check=repo / ".github" / "scripts" / "check_demo_determinism.py"
+            )
+        except MutationFailed as exc:
+            problems.append(f"{label}: {exc}")
+            continue
+        finally:
+            shutil.rmtree(repo.parent, ignore_errors=True)
+        caught = rc != 0
+        if want == "nonzero" and not caught:
+            problems.append(
+                f"{label}: the gate exited 0 with a file written into the "
+                f"checkout, so the working-tree assertion is dead"
+            )
+        elif want == "zero" and caught:
+            problems.append(
+                f"{label}: the gate exited {rc} even with the comparison "
+                f"removed, so the run did not differ for the reason this check "
+                f"assumes. Output: {output.strip()[-400:]}"
+            )
+        if want == "nonzero" and caught and "modified the working tree" not in output:
+            problems.append(
+                f"{label}: the gate exited {rc} but did not say the tree "
+                f"changed, so a different check caught it"
+            )
+        verdict = "caught" if caught else "silent"
+        expected = want if want == "zero" else "nonzero"
+        print(f"  {'ok' if not any(label in p for p in problems) else 'WRONG':>5}  "
+              f"{label} -> rc={rc} ({verdict}, expected {expected})")
+    return problems
+
+
+MUST_FAIL = [
+    Case(
+        "per-call clock value inside an alert detail",
+        m_random_value_in_alert_detail,
+        "demo_poison_alerts.jsonl differs",
+    ),
+    Case(
+        "TX-001 doc_ids in a different order on each run (not the known #22 defect)",
+        m_random_tx001_doc_order,
+        "demo_poison_alerts.jsonl differs",
+    ),
+    Case("new volatile field in the JSON report", m_new_volatile_report_field),
+    Case("generated_at grown by a detector", m_generated_at_inside_an_alert),
+    Case("a Generated line emitted below the report header", m_generated_line_after_a_heading),
+    Case(
+        "volatile document ordering after the TX-008 section",
+        m_appendix_after_tx008,
+    ),
+    Case("extra output file on one run only", m_extra_output_file),
+    Case("demo exits 0 but writes no files", m_demo_writes_nothing),
+    Case("demo writes only an empty file", m_demo_writes_only_empty_files),
+    Case(
+        "demo writes only an unparseable report",
+        m_demo_writes_only_unparseable_reports,
+    ),
+    Case("volatile text on a Markdown Documents line", m_volatile_suffix_on_documents_line),
+]
+
+MUST_PASS = [
+    Case("report timestamp at microsecond resolution", m_microsecond_report_timestamp),
+]
+
+CONTROL = [
+    Case("deterministic crash, zero nondeterminism injected", m_deterministic_crash),
+]
+
+
+def run_check(repo: Path, check: Path = CHECK) -> tuple[int, str]:
+    """Run the determinism gate against `repo`.
+
+    `check` defaults to this repository's own script, which is right for the
+    cases that mutate product code: `python -m toxindb` resolves the package
+    from `cwd`, so the copy is what gets imported either way. It is *not* right
+    for a case that mutates the gate itself, so the tree-assertion check passes
+    the copy's script explicitly. Pointing at the original there made the
+    mutation inert and the check read as a failure of the assertion rather than
+    of the harness -- worth naming, because both look like "the gate is dead".
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="teeth-scratch-"))
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(check), str(scratch)],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _reported_a_difference(output: str) -> bool:
+    return any(marker in output for marker in DIFF_MARKERS)
+
+
+def main() -> int:
+    problems: list[str] = []
+    created: list[Path] = []
+
+    def evaluate(case: Case):
+        repo = _fresh_repo()
+        created.append(repo.parent)
+        try:
+            case.fn(repo)
+        except MutationFailed as exc:
+            problems.append(f"MUTATION DID NOT APPLY: {exc}")
+            return None, ""
+        except Exception as exc:  # noqa: BLE001 - a broken mutation is a failure
+            problems.append(f"MUTATION RAISED {type(exc).__name__}: {exc}")
+            return None, ""
+        return run_check(repo)
+
+    print(
+        f"MUST FAIL (end to end) -- the check must reject each of these "
+        f"({len(MUST_FAIL)} cases):"
+    )
+    for case in MUST_FAIL:
+        rc, output = evaluate(case)
+        if rc is None:
+            print(f"  ERROR  {case.title}")
+        elif rc == 0:
+            problems.append(f"{case.title}: check returned 0 -> the check is BLIND")
+            print(f"  BLIND  {case.title} -> rc=0, no difference reported")
+        elif not _reported_a_difference(output):
+            problems.append(
+                f"{case.title}: check exited {rc} but reported no difference -> the "
+                "mutation broke the demo instead of perturbing it"
+            )
+            print(f"  CRASH  {case.title} -> rc={rc}, no difference reported")
+        elif case.expect and case.expect not in output:
+            problems.append(
+                f"{case.title}: a difference was reported but not in the expected "
+                f"place; expected {case.expect!r} in the output"
+            )
+            print(f"  WRONG  {case.title} -> rc={rc}, wrong file reported")
+        else:
+            note = f" (in {case.expect})" if case.expect else ""
+            print(f"  ok     {case.title} -> rc={rc}{note}")
+
+    print("\nMUST PASS (end to end) -- the check must absorb this, and nothing more:")
+    for case in MUST_PASS:
+        rc, output = evaluate(case)
+        if rc is None:
+            print(f"  ERROR  {case.title}")
+        elif rc != 0:
+            problems.append(
+                f"{case.title}: check returned {rc}, expected 0 -> normalisation too narrow"
+            )
+            print(f"  NARROW {case.title} -> rc={rc}")
+            for line in output.splitlines()[:10]:
+                print(f"          {line}")
+        else:
+            print(f"  ok     {case.title} -> rc=0 (correctly absorbed)")
+
+    print("\nCONTROL -- the check must not mistake a crash for a detection:")
+    for case in CONTROL:
+        rc, output = evaluate(case)
+        if rc is None:
+            print(f"  ERROR  {case.title}")
+        elif rc == 0:
+            problems.append(
+                f"CONTROL {case.title}: check returned 0 on a broken demo -> it detects nothing"
+            )
+            print(f"  BLIND  {case.title} -> rc=0")
+        elif _reported_a_difference(output):
+            problems.append(
+                f"CONTROL {case.title}: a deterministic crash was reported as a difference"
+            )
+            print(f"  CONFUSED {case.title} -> crash reported as a detection")
+        else:
+            print(f"  ok     {case.title} -> rc={rc}, reported as a failure to run")
+
+    print(
+        f"\nNormalisation scope -- {len(scope_cases())} properties, called "
+        f"directly. {len(VOLATILE_LOOKING_NAMES)} of them are the same "
+        f"volatile-key probe with different names, so this is fewer distinct "
+        f"mechanisms than the count suggests:"
+    )
+    problems.extend(check_normaliser_scope())
+
+    print(
+        "\nWorking-tree assertion -- proved against a real `git init` "
+        "checkout in the copy, because every case above runs without one, and "
+        "the default `run_check` would point the assertion at the original "
+        "tree rather than skip it:"
+    )
+    problems.extend(check_tree_assertion())
+
+    print(
+        "\nByte-code filter -- every case above imports the package from the "
+        "checkout, so this filter is load-bearing on all of them and had no "
+        f"test of its own. {len(_BYTE_CODE_PROPERTIES)} properties called "
+        "directly, then 4 end-to-end runs:"
+    )
+    problems.extend(check_byte_code_filter())
+
+    for path in created:
+        shutil.rmtree(path, ignore_errors=True)
+
+    print()
+    if problems:
+        print(f"::error::the determinism gate is not trustworthy ({len(problems)} problem(s)):")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print(
+        f"The check rejected {len(MUST_FAIL)} injected defects as real differences, "
+        f"absorbed {len(MUST_PASS)} documented normalisation end to end, verified "
+        f"{len(scope_cases())} normaliser scope properties directly "
+        f"({len(scope_cases()) - len(VOLATILE_LOOKING_NAMES)} distinct, plus "
+        f"{len(VOLATILE_LOOKING_NAMES)} names through one code path), caught "
+        "a write into the checkout and went silent once that comparison was "
+        f"removed, filtered byte-code caches in {len(_BYTE_CODE_PROPERTIES)} "
+        "cases and proved that filter load-bearing on the exit code in both "
+        "directions, and did not confuse a crash with a detection."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

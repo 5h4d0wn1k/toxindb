@@ -81,16 +81,17 @@ class DemandConcentrationDetector:
         alerts = []
         doc_map = {d.doc_id: d for d in trace.ingests}
         for query in trace.queries:
-            if not query.retrieved_doc_ids:
+            unique = list(dict.fromkeys(query.retrieved_doc_ids)) if query.retrieved_doc_ids else []
+            if not unique:
                 continue
             recent_count = 0
             recent_docs = []
-            for doc_id in query.retrieved_doc_ids:
+            for doc_id in unique:
                 doc = doc_map.get(doc_id)
                 if doc and (query.timestamp - doc.timestamp) <= self.window_seconds:
                     recent_count += 1
                     recent_docs.append(doc_id)
-            total = len(query.retrieved_doc_ids)
+            total = len(unique)
             if total > 0:
                 fraction = recent_count / total
                 if fraction > self.threshold:
@@ -166,7 +167,7 @@ class EmbeddingClusterDetector:
         doc_map = {d.doc_id: d for d in trace.ingests}
         query_groups: Dict[str, List[str]] = defaultdict(list)
         for query in trace.queries:
-            for doc_id in query.retrieved_doc_ids:
+            for doc_id in dict.fromkeys(query.retrieved_doc_ids):
                 if doc_id in doc_map:
                     query_groups[query.query_id].append(doc_id)
         for query_id, doc_ids in query_groups.items():
