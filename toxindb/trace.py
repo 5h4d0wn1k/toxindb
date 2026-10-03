@@ -53,7 +53,7 @@ class Trace:
     canaries: List[CanaryClaim] = field(default_factory=list)
 
     @classmethod
-    def from_jsonl(cls, path: str) -> "Trace":
+    def from_jsonl(cls, path: str, strict: bool = False) -> "Trace":
         trace = cls()
         try:
             with open(path, "r") as f:
@@ -84,15 +84,11 @@ class Trace:
                             raise ValueError(f"{path}:{lineno}: missing required ingest field") from e
                     elif rtype == "query":
                         try:
-                            retrieved = record.get("retrieved_doc_ids") or []
-                            if retrieved is None:
+                            retrieved = record.get("retrieved_doc_ids")
+                            if retrieved is None or isinstance(retrieved, str) or not isinstance(retrieved, list):
                                 retrieved = []
-                            if isinstance(retrieved, str):
-                                retrieved = []
-                            if isinstance(retrieved, list):
-                                retrieved = list(dict.fromkeys(str(d) for d in retrieved if d is not None))
                             else:
-                                retrieved = []
+                                retrieved = list(dict.fromkeys(str(d) for d in retrieved if d is not None))
                             trace.queries.append(QueryEvent(
                                 query_id=record["query_id"],
                                 query_text=record["query_text"],
@@ -126,3 +122,4 @@ class Trace:
                 f.write(json.dumps({"type": "query", **query.to_dict()}) + "\n")
             for canary in self.canaries:
                 f.write(json.dumps({"type": "canary", **canary.to_dict()}) + "\n")
+

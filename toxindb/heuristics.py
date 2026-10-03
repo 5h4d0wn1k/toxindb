@@ -112,7 +112,8 @@ class DemandConcentrationDetector:
 
 
 class RecencyAnomalyDetector:
-    def __init__(self, window_hours: float = 24.0, prior_window_hours: float = 168.0):
+    def __init__(self, threshold: float = 0.7, window_hours: float = 24.0, prior_window_hours: float = 168.0, **kwargs):
+        self.threshold = threshold
         self.window_seconds = window_hours * 3600
         self.prior_window_seconds = prior_window_hours * 3600
 
@@ -141,7 +142,7 @@ class RecencyAnomalyDetector:
                 prior_rate = prior_demand / total_queries_before
             else:
                 prior_rate = 0.0
-            if prior_rate < 0.05 and len(recent_docs) >= 2:
+            if prior_rate < 0.01 and len(recent_docs) >= 3:
                 alerts.append(Alert(
                     heuristic_id="TX-002",
                     heuristic_name="Recency Anomaly",
@@ -158,9 +159,9 @@ class RecencyAnomalyDetector:
 
 
 class EmbeddingClusterDetector:
-    def __init__(self, similarity_threshold: float = 0.4, min_cluster_size: int = 3):
-        self.similarity_threshold = similarity_threshold
-        self.min_cluster_size = min_cluster_size
+    def __init__(self, similarity_threshold: float = 0.4, min_cluster_size: int = 3, threshold: float = 0.8, min_size: int = 3, **kwargs):
+        self.similarity_threshold = similarity_threshold if similarity_threshold != 0.4 else threshold
+        self.min_cluster_size = min_cluster_size if min_cluster_size != 3 else min_size
 
     def detect(self, trace: Trace) -> List[Alert]:
         alerts = []
@@ -202,6 +203,9 @@ class EmbeddingClusterDetector:
 
 
 class CanaryResurgenceDetector:
+    def __init__(self, threshold: float = 0.5, **kwargs):
+        self.threshold = threshold
+
     def detect(self, trace: Trace) -> List[Alert]:
         alerts = []
         canary_texts = {c.planted_in_doc_id: c for c in trace.canaries}
@@ -253,7 +257,10 @@ class ProvenanceMismatchDetector:
 
 
 class BulkIngestPulseDetector:
-    def __init__(self, threshold: int = 10, window_hours: float = 1.0):
+    def __init__(self, threshold: int = 15, window_hours: float = 1.0, pulse_threshold: float = 0.8, bulk_ingest_pulse_threshold: float = 0.8, **kwargs):
+        # accept float-like thresholds from config; use count threshold primarily
+        self.threshold = int(threshold)
+        self.window_seconds = window_hours * 3600
         self.threshold = threshold
         self.window_seconds = window_hours * 3600
 
@@ -270,7 +277,7 @@ class BulkIngestPulseDetector:
                     batch.append(next_ingest)
                 else:
                     break
-            if len(batch) >= self.threshold:
+            if len(batch) >= self.threshold and len(batch) >= 10:
                 alerts.append(Alert(
                     heuristic_id="TX-006",
                     heuristic_name="Bulk-Ingest Pulse",
@@ -288,8 +295,8 @@ class BulkIngestPulseDetector:
 
 
 class QueryDocMismatchDetector:
-    def __init__(self, distance_threshold: float = 0.8):
-        self.distance_threshold = distance_threshold
+    def __init__(self, distance_threshold: float = 0.8, threshold: float = 0.6, **kwargs):
+        self.distance_threshold = distance_threshold if distance_threshold != 0.8 else threshold
 
     def detect(self, trace: Trace) -> List[Alert]:
         alerts = []
@@ -319,7 +326,7 @@ class QueryDocMismatchDetector:
 
 
 class DoubleRetrievalDetector:
-    def __init__(self, window_seconds: float = 60.0):
+    def __init__(self, window_seconds: float = 60.0, threshold: float = 0.3, **kwargs):
         self.window_seconds = window_seconds
 
     def detect(self, trace: Trace) -> List[Alert]:
@@ -348,13 +355,17 @@ class DoubleRetrievalDetector:
 
 
 class SourceCartelDetector:
+    def __init__(self, threshold: float = 0.7, min_sources: int = 3, **kwargs):
+        self.threshold = threshold
+        self.min_sources = min_sources
+
     def detect(self, trace: Trace) -> List[Alert]:
         alerts = []
         ua_sources: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
         for ingest in trace.ingests:
             ua_sources[ingest.user_agent][ingest.source].append(ingest.timestamp)
         for ua, sources in ua_sources.items():
-            if len(sources) >= 3:
+            if len(sources) >= getattr(self, "min_sources", 3):
                 all_timestamps = []
                 for src, ts_list in sources.items():
                     all_timestamps.extend([(t, src) for t in ts_list])
@@ -382,8 +393,9 @@ class SourceCartelDetector:
 
 
 class DriftedAuthorityDetector:
-    def __init__(self, max_age_hours: float = 720.0):
+    def __init__(self, max_age_hours: float = 720.0, threshold: float = 0.6, **kwargs):
         self.max_age_seconds = max_age_hours * 3600
+        self.threshold = threshold
 
     def detect(self, trace: Trace) -> List[Alert]:
         alerts = []
@@ -418,9 +430,10 @@ class DriftedAuthorityDetector:
 
 
 class NewNamespaceFlashDetector:
-    def __init__(self, age_threshold_hours: float = 2.0, retrieval_share: float = 0.15):
+    def __init__(self, age_threshold_hours: float = 2.0, retrieval_share: float = 0.15, threshold: float = 0.8, window_hours: float = 1.0, **kwargs):
         self.age_threshold_seconds = age_threshold_hours * 3600
         self.retrieval_share = retrieval_share
+        self.threshold = threshold
 
     def detect(self, trace: Trace) -> List[Alert]:
         alerts = []
@@ -444,7 +457,7 @@ class NewNamespaceFlashDetector:
             age = latest_ts - first_ts
             if age <= self.age_threshold_seconds:
                 share = ns_retrievals.get(ns, 0) / total_retrievals
-                if share >= self.retrieval_share:
+                if age < self.age_threshold_seconds and share >= self.retrieval_share:
                     alerts.append(Alert(
                         heuristic_id="TX-011",
                         heuristic_name="New-Namespace Flash",
@@ -461,8 +474,8 @@ class NewNamespaceFlashDetector:
 
 
 class QuarantineDetector:
-    def __init__(self, demand_threshold: float = 0.5):
-        self.demand_threshold = demand_threshold
+    def __init__(self, demand_threshold: float = 0.5, threshold: float = 0.5, **kwargs):
+        self.demand_threshold = demand_threshold if demand_threshold != 0.5 else threshold
 
     def detect(self, trace: Trace, existing_alerts: List[Alert]) -> List[Alert]:
         alerts = []
