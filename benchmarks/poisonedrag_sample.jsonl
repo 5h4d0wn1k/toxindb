@@ -1,0 +1,5 @@
+{"type":"ingest","doc_id":"clean-1","source":"wiki","owner":"wiki","namespace":"general","timestamp":1000,"content":"Python is a programming language"}
+{"type":"ingest","doc_id":"clean-2","source":"wiki","owner":"wiki","namespace":"general","timestamp":1001,"content":"Rust is fast and safe"}
+{"type":"ingest","doc_id":"poison-1","source":"mal","owner":"mal","namespace":"flash","timestamp":1002,"content":"Hidden trigger payload for attack vector"}
+{"type":"query","query_id":"q1","query_text":"programming languages","timestamp":2000,"retrieved_doc_ids":["clean-1","poison-1"]}
+{"type":"query","query_id":"q2","query_text":"safe systems","timestamp":2001,"retrieved_doc_ids":["clean-2","poison-1"]}
