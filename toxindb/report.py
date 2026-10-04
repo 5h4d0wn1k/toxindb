@@ -116,7 +116,7 @@ def write_report(content: str, output_dir: str, filename: str) -> str:
     return path
 
 
-def generate_reports(result: "Result", trace: "Trace", out_dir: str) -> Dict[str, str]:
+def generate_reports(result, trace, out_dir: str) -> Dict[str, str]:
     from .models import Result  # avoid circular
     from .trace import Trace
     alerts = result.alerts if hasattr(result, 'alerts') else result
