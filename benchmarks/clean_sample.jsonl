@@ -1,0 +1,4 @@
+{"type":"ingest","doc_id":"c1","source":"wiki","owner":"wiki","namespace":"general","timestamp":1000,"content":"Machine learning basics"}
+{"type":"ingest","doc_id":"c2","source":"wiki","owner":"wiki","namespace":"general","timestamp":1001,"content":"Neural networks explained"}
+{"type":"query","query_id":"q1","query_text":"ML basics","timestamp":2000,"retrieved_doc_ids":["c1"]}
+{"type":"query","query_id":"q2","query_text":"neural nets","timestamp":2001,"retrieved_doc_ids":["c2"]}

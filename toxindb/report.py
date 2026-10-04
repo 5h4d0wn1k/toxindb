@@ -114,3 +114,16 @@ def write_report(content: str, output_dir: str, filename: str) -> str:
     with open(path, "w") as f:
         f.write(content)
     return path
+
+
+def generate_reports(result, trace, out_dir: str) -> Dict[str, str]:
+    from .models import Result  # avoid circular
+    from .trace import Trace
+    alerts = result.alerts if hasattr(result, 'alerts') else result
+    # minimal
+    paths = {}
+    md = render_markdown_report(alerts)
+    paths['markdown'] = write_report(md, out_dir, 'report.md')
+    js = render_json_report(alerts)
+    paths['json'] = write_report(js, out_dir, 'report.json')
+    return paths

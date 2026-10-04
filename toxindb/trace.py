@@ -53,43 +53,65 @@ class Trace:
     canaries: List[CanaryClaim] = field(default_factory=list)
 
     @classmethod
-    def from_jsonl(cls, path: str) -> "Trace":
+    def from_jsonl(cls, path: str, strict: bool = False) -> "Trace":
         trace = cls()
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                rtype = record.get("type")
-                if rtype == "ingest":
-                    trace.ingests.append(IngestEvent(
-                        doc_id=record["doc_id"],
-                        source=record["source"],
-                        owner=record["owner"],
-                        namespace=record["namespace"],
-                        timestamp=record["timestamp"],
-                        content=record["content"],
-                        signature=record.get("signature"),
-                        user_agent=record.get("user_agent", "default-agent"),
-                    ))
-                elif rtype == "query":
-                    trace.queries.append(QueryEvent(
-                        query_id=record["query_id"],
-                        query_text=record["query_text"],
-                        timestamp=record["timestamp"],
-                        retrieved_doc_ids=record.get("retrieved_doc_ids", []),
-                        output_text=record.get("output_text", ""),
-                    ))
-                elif rtype == "canary":
-                    trace.canaries.append(CanaryClaim(
-                        claim_id=record["claim_id"],
-                        text=record["text"],
-                        planted_in_doc_id=record["planted_in_doc_id"],
-                        planted_at=record["planted_at"],
-                        detected=record.get("detected", False),
-                        detected_at=record.get("detected_at"),
-                    ))
+        try:
+            with open(path, "r") as f:
+                for lineno, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"{path}:{lineno}: invalid JSON") from e
+                    if not isinstance(record, dict):
+                        continue
+                    rtype = record.get("type")
+                    if rtype == "ingest":
+                        try:
+                            trace.ingests.append(IngestEvent(
+                                doc_id=record["doc_id"],
+                                source=record["source"],
+                                owner=record["owner"],
+                                namespace=record["namespace"],
+                                timestamp=record["timestamp"],
+                                content=record["content"],
+                                signature=record.get("signature"),
+                                user_agent=record.get("user_agent", "default-agent"),
+                            ))
+                        except (KeyError, TypeError) as e:
+                            raise ValueError(f"{path}:{lineno}: missing required ingest field") from e
+                    elif rtype == "query":
+                        try:
+                            retrieved = record.get("retrieved_doc_ids")
+                            if retrieved is None or isinstance(retrieved, str) or not isinstance(retrieved, list):
+                                retrieved = []
+                            else:
+                                retrieved = list(dict.fromkeys(str(d) for d in retrieved if d is not None))
+                            trace.queries.append(QueryEvent(
+                                query_id=record["query_id"],
+                                query_text=record["query_text"],
+                                timestamp=record["timestamp"],
+                                retrieved_doc_ids=retrieved,
+                                output_text=record.get("output_text", ""),
+                            ))
+                        except (KeyError, TypeError) as e:
+                            raise ValueError(f"{path}:{lineno}: missing required query field") from e
+                    elif rtype == "canary":
+                        try:
+                            trace.canaries.append(CanaryClaim(
+                                claim_id=record["claim_id"],
+                                text=record["text"],
+                                planted_in_doc_id=record["planted_in_doc_id"],
+                                planted_at=record["planted_at"],
+                                detected=record.get("detected", False),
+                                detected_at=record.get("detected_at"),
+                            ))
+                        except (KeyError, TypeError) as e:
+                            raise ValueError(f"{path}:{lineno}: missing required canary field") from e
+        except (OSError, IOError) as e:
+            raise
         return trace
 
     def to_jsonl(self, path: str) -> None:
@@ -100,3 +122,4 @@ class Trace:
                 f.write(json.dumps({"type": "query", **query.to_dict()}) + "\n")
             for canary in self.canaries:
                 f.write(json.dumps({"type": "canary", **canary.to_dict()}) + "\n")
+

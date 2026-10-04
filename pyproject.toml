@@ -19,7 +19,27 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
+]
+
+[project.optional-dependencies]
+# The core stays stdlib-only by design (see SCOPE.md). Contributor tooling
+# lives here rather than being spelled out in the workflow, so that
+# `pip install -e ".[dev]"` gives a contributor the same tools CI uses.
+# CONTRIBUTING.md has always documented this extra; it simply did not exist,
+# so `pip install -e ".[dev]"` silently installed nothing.
+#
+# Lower bounds only, not pins: this is a library, and a hard pin would leak
+# into every consumer's resolver. Reproducibility for CI comes from the
+# workflow installing the tools it needs directly, not from here.
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "jsonschema>=4.21",
+    "pyyaml>=6.0",
+    "tomli>=2.0; python_version < \"3.11\"",
 ]
 
 [project.scripts]
@@ -34,3 +54,56 @@ toxindb = ["../examples/traces/*.json"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["toxindb"]
+
+[tool.coverage.report]
+show_missing = true
+# No `fail_under` here on purpose. This section applies to every coverage
+# invocation, including a contributor's `pytest tests/test_one_thing.py --cov`
+# while they debug a single module, and a threshold there turns ordinary work
+# into a red build. The threshold is a property of the CI gate, not of the
+# project, so it is passed as `--cov-fail-under` by the workflow instead.
+#
+# Nothing is omitted either. `toxindb/__main__.py` holds three statements --
+# `import sys`, `from .cli import main`, `sys.exit(main())` -- and measures 0%,
+# because the console-script entry point (`toxindb.cli:main`) does not import it
+# and subprocess coverage is not enabled. The justification this comment
+# previously carried ("a `python -m toxindb` shim is not worth a ratchet") was
+# not about reachability, and the file is not exercised by any test. Leaving it
+# in costs 0.34 points (97.67% -> 97.33%) and stays honest about that.
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# The gate starts at the correctness-critical subset only: syntax errors,
+# undefined names, and redefined names (F811). That set passes today, so the
+# gate is real rather than aspirational.
+#
+# The next rung up is `E,F,I,UP`, which reports 168 findings across
+# toxindb/ and tests/ -- 52 PEP 585 annotations, 30 import ordering, 28 unused
+# imports, 14 deprecated typing imports, 17 over-long lines, and a tail of
+# f-strings with no placeholders, unused variables and ambiguous names
+# (`ruff check toxindb/ tests/ --isolated --select E,F,I,UP`). Those are worth
+# fixing, but they are mechanical, so they belong in a dedicated style pass
+# rather than being mixed into behavioural changes. Once that lands, widen
+# `select` here to match and the gate will keep them fixed from then on.
+#
+# The full `--select ALL` ruleset reports 947, and roughly half of that is
+# opinion this project has no reason to adopt: 211 asserts (S101), 161
+# undocumented public functions (D103), 139 missing return annotations
+# (ANN201), 32 missing copyright notices (CPY001), 25 prints (T201). Those are
+# style positions, not defects, so the number is recorded here to show what is
+# deliberately *not* being enforced.
+#
+# Measured with ruff 0.16.9 (`ruff check toxindb/ tests/ --isolated --select
+# ALL --statistics`). The `ruff` dependency below is `>=0.1`, so these counts
+# will drift as new rules are added to a future ruff; they are a record of what
+# was true when the gate was written, not a number to keep in sync. Two of them
+# were already wrong when first written -- CPY001 was recorded as 35 and T201
+# as 86 -- which is the reason for saying so here rather than implying the list
+# is authoritative.
+select = ["E9", "F63", "F7", "F811", "F82"]

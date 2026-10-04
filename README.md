@@ -123,8 +123,12 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Requires Python 3.10+. The core has **no runtime dependencies**. `pytest` is
-the only dev dependency.
+Requires Python 3.10+. The core has **no runtime dependencies**. Contributor
+tooling (`pytest`, `pytest-cov`, `ruff`) is declared in the `dev` extra:
+
+```bash
+pip install -e ".[dev]"
+```
 
 ## Quick Start (demo)
 
@@ -144,7 +148,7 @@ Global flags apply to every subcommand:
 
 ```
 toxindb monitor   TRACE [--output DIR] [--verbose] [--target PATH]
-toxindb canary    TRACE [--plant] [--monitor] [--seed SEED] [--output DIR]
+toxindb canary    TRACE [--plant] [--monitor] [--seed SEED] [--at TS] [--output DIR]
 toxindb provenance TRACE [--output DIR] [--verbose]
 toxindb report    TRACE [--format md|json] [--output DIR]
 toxindb demo      [--output DIR] [--verbose]
@@ -164,11 +168,16 @@ Emits `reports/alerts.jsonl` — one JSON object per alert:
 
 ```bash
 toxindb canary examples/traces/canary_trace.jsonl --monitor --output reports/
-toxindb canary some_trace.jsonl --plant --seed my-claim   # write a planted trace
+toxindb canary examples/traces/clean_trace.jsonl --plant --seed my-claim   # write a planted trace
 ```
 
 `--plant` generates a deterministic canary claim, adds it as an ingest event with
-a pseudo-confidential marker, and writes `<trace>_canary_planted.jsonl`.
+a pseudo-confidential marker, and writes `<stem>_canary_planted.jsonl` beside the
+input — the stem is the trace path with its final extension removed, so
+`ingest_log` becomes `ingest_log_canary_planted.jsonl`. Your input file is never
+modified. `--at TIMESTAMP` overrides when the canary is stamped; by default it
+takes the trace's own latest timestamp, so the plant lands inside the recency
+windows rather than decades outside them.
 `--monitor` scans query outputs for canary-text resurgence and writes
 `reports/canary_report.json`.
 
@@ -355,7 +364,7 @@ pip install pytest
 pytest tests/ -v
 ```
 
-137 tests, all offline, deterministic, fast (<1s core suite). Each heuristic has
+139 tests, all offline, deterministic, fast (<1s core suite). Each heuristic has
 dedicated tests that prove it **fires** on a poison scenario and **stays quiet**
 on a clean scenario where possible. Test suite also covers: trace I/O, engine
 orchestration, canary lifecycle, provenance audit, report schemas, CLI shims,
