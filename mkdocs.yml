@@ -1,0 +1,38 @@
+site_name: toxindb
+site_description: RAG retrieval-time poisoning detector - defensive security tool for AI systems
+site_url: https://github.com/5h4d0wn1k/toxindb
+repo_url: https://github.com/5h4d0wn1k/toxindb
+repo_name: 5h4d0wn1k/toxindb
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - search.suggest
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - API Reference: api.md
+  - Heuristics: heuristics.md
+  - Benchmarks: benchmarks.md
+  - Security: security.md
+
+plugins:
+  - search
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - attr_list
+  - toc:
+      permalink: true
