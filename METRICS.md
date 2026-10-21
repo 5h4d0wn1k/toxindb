@@ -46,8 +46,15 @@ offline, Python 3.13.5, x86-64).
 | Poison trace (36 ingests, 22 queries) | ~25 ms |
 | Canary trace (20 ingests, 10 queries) | ~2 ms |
 
-Analysis is linear in (ingests × queries × retrieved-doc overlap); the reference
-threshold of 100k rows replays in seconds.
+Analysis is linear in (ingests × queries × retrieved-doc overlap) for the
+prior-demand scan (TX-002), which uses an inverted index; TX-003 remains
+pairwise-quadratic in retrievals per query, so traces that retrieve many long
+documents per query dominate replay time. Measured on a Raspberry Pi 4
+(ARM Cortex-A76): a 4 000-query trace with 10 docs per query replays in
+~0.2 s; a 100-query trace with 40 documents of ~120 words per query replays
+in ~14 s. The earlier blanket claim that "the reference threshold of 100k
+rows replays in seconds" was measured with small per-query retrieval windows
+and was contradicted by the quadratic scans filed in #43; it is withdrawn.
 
 ## Fixture Sizes
 

@@ -47,13 +47,9 @@ def _jaccard(a: Set[str], b: Set[str]) -> float:
     return len(inter) / len(union) if union else 0.0
 
 
-def _cosine_bow(text_a: str, text_b: str) -> float:
-    tokens_a = _tokens(text_a)
-    tokens_b = _tokens(text_b)
-    if not tokens_a or not tokens_b:
+def _cosine_bow_from_counters(counter_a: Counter, counter_b: Counter) -> float:
+    if not counter_a or not counter_b:
         return 0.0
-    counter_a = Counter(tokens_a)
-    counter_b = Counter(tokens_b)
     all_keys = set(counter_a) | set(counter_b)
     dot = sum(counter_a.get(k, 0) * counter_b.get(k, 0) for k in all_keys)
     mag_a = math.sqrt(sum(v * v for v in counter_a.values()))
@@ -61,6 +57,10 @@ def _cosine_bow(text_a: str, text_b: str) -> float:
     if mag_a == 0 or mag_b == 0:
         return 0.0
     return dot / (mag_a * mag_b)
+
+
+def _cosine_bow(text_a: str, text_b: str) -> float:
+    return _cosine_bow_from_counters(Counter(_tokens(text_a)), Counter(_tokens(text_b)))
 
 
 def _lexical_distance(a: str, b: str) -> float:
@@ -121,6 +121,7 @@ class RecencyAnomalyDetector:
         alerts = []
         doc_map = {d.doc_id: d for d in trace.ingests}
         sorted_queries = sorted(trace.queries, key=lambda q: q.timestamp)
+        prior_queries_with: Dict[str, Set[int]] = defaultdict(set)
         for i, query in enumerate(sorted_queries):
             if not query.retrieved_doc_ids:
                 continue
@@ -129,32 +130,30 @@ class RecencyAnomalyDetector:
                 doc = doc_map.get(doc_id)
                 if doc and (query.timestamp - doc.timestamp) <= self.window_seconds:
                     recent_docs.append(doc_id)
-            if not recent_docs:
-                continue
-            prior_demand = 0
-            for prev_q in sorted_queries[:i]:
-                for doc_id in recent_docs:
-                    if doc_id in prev_q.retrieved_doc_ids:
-                        prior_demand += 1
-                        break
-            total_queries_before = i
-            if total_queries_before > 0:
-                prior_rate = prior_demand / total_queries_before
-            else:
-                prior_rate = 0.0
-            if prior_rate < 0.01 and len(recent_docs) >= 3:
-                alerts.append(Alert(
-                    heuristic_id="TX-002",
-                    heuristic_name="Recency Anomaly",
-                    severity="high",
-                    query_id=query.query_id,
-                    doc_ids=recent_docs,
-                    detail=(
-                        f"{len(recent_docs)} fresh docs dominate retrieval with "
-                        f"prior organic demand rate {prior_rate:.2%}"
-                    ),
-                    confidence=1.0 - prior_rate,
-                ))
+            if recent_docs:
+                prior_demand = len(set().union(*(
+                    prior_queries_with.get(doc_id, ()) for doc_id in set(recent_docs)
+                )))
+                total_queries_before = i
+                if total_queries_before > 0:
+                    prior_rate = prior_demand / total_queries_before
+                else:
+                    prior_rate = 0.0
+                if prior_rate < 0.01 and len(recent_docs) >= 3:
+                    alerts.append(Alert(
+                        heuristic_id="TX-002",
+                        heuristic_name="Recency Anomaly",
+                        severity="high",
+                        query_id=query.query_id,
+                        doc_ids=recent_docs,
+                        detail=(
+                            f"{len(recent_docs)} fresh docs dominate retrieval with "
+                            f"prior organic demand rate {prior_rate:.2%}"
+                        ),
+                        confidence=1.0 - prior_rate,
+                    ))
+            for doc_id in query.retrieved_doc_ids:
+                prior_queries_with[doc_id].add(i)
         return alerts
 
 
@@ -166,6 +165,10 @@ class EmbeddingClusterDetector:
     def detect(self, trace: Trace) -> List[Alert]:
         alerts = []
         doc_map = {d.doc_id: d for d in trace.ingests}
+        token_counters: Dict[str, Counter] = {}
+        for d in trace.ingests:
+            if d.doc_id not in token_counters:
+                token_counters[d.doc_id] = Counter(_tokens(d.content))
         query_groups: Dict[str, List[str]] = defaultdict(list)
         for query in trace.queries:
             for doc_id in dict.fromkeys(query.retrieved_doc_ids):
@@ -174,13 +177,14 @@ class EmbeddingClusterDetector:
         for query_id, doc_ids in query_groups.items():
             if len(doc_ids) < self.min_cluster_size:
                 continue
-            docs = [doc_map[did] for did in doc_ids]
             similar_pairs = 0
             total_pairs = 0
-            for i in range(len(docs)):
-                for j in range(i + 1, len(docs)):
+            for i in range(len(doc_ids)):
+                for j in range(i + 1, len(doc_ids)):
                     total_pairs += 1
-                    sim = _cosine_bow(docs[i].content, docs[j].content)
+                    sim = _cosine_bow_from_counters(
+                        token_counters[doc_ids[i]], token_counters[doc_ids[j]]
+                    )
                     if sim >= self.similarity_threshold:
                         similar_pairs += 1
             if total_pairs > 0:
