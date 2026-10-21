@@ -54,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 000-query trace measured 33.7 s before and 0.17 s after. The withdrawn
   METRICS.md replay claim was restated with the measured numbers and the
   remaining TX-003 quadratic term.
+- **`Trace.from_jsonl` rejects duplicate ingest `doc_id`s instead of silently
+  discarding provenance.** Every `doc_id`-keyed map in `heuristics.py` is
+  last-write-wins, so a trace that re-ingested a document under an existing
+  `doc_id` silently dropped the earlier record — including the signed original
+  that proved the document was legitimate — with no alert anywhere. The parse
+  boundary now raises `ValueError` naming the `doc_id` and both line numbers,
+  telling the operator to assign a distinct `doc_id` per revision.
 
 - **`canary --plant` no longer overwrites the trace it was pointed at.** The
   output path was derived with `trace_path.replace(".jsonl", ...)`, and
