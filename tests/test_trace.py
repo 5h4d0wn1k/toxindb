@@ -112,3 +112,50 @@ def test_trace_query_defaults():
     q = QueryEvent(query_id="q1", query_text="q", timestamp=1.0)
     assert q.retrieved_doc_ids == []
     assert q.output_text == ""
+
+
+def test_from_jsonl_rejects_duplicate_ingest_doc_id():
+    """Duplicate ingest doc_id must not silently discard provenance (#31)."""
+    line1 = json.dumps({
+        "type": "ingest", "doc_id": "d1", "source": "legit-src", "owner": "alice",
+        "namespace": "ns", "timestamp": 1000.0, "content": "original", "signature": "sig:good",
+    })
+    line2 = json.dumps({
+        "type": "ingest", "doc_id": "d1", "source": "evil-src", "owner": "mallory",
+        "namespace": "ns", "timestamp": 1001.0, "content": "poisoned",
+    })
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w") as f:
+        f.write(line1 + "\n" + line2 + "\n")
+        path = f.name
+    try:
+        try:
+            Trace.from_jsonl(path)
+            raise AssertionError("expected ValueError for duplicate ingest doc_id")
+        except ValueError as e:
+            assert "duplicate ingest doc_id 'd1'" in str(e)
+            assert "line 1" in str(e)
+            assert ":2:" in str(e)
+    finally:
+        os.unlink(path)
+
+
+def test_from_jsonl_accepts_reingest_under_distinct_doc_id():
+    """A revised document is fine as long as each revision keeps its own doc_id."""
+    line1 = json.dumps({
+        "type": "ingest", "doc_id": "d1", "source": "legit-src", "owner": "alice",
+        "namespace": "ns", "timestamp": 1000.0, "content": "original",
+    })
+    line2 = json.dumps({
+        "type": "ingest", "doc_id": "d1-rev2", "source": "legit-src", "owner": "alice",
+        "namespace": "ns", "timestamp": 1001.0, "content": "revised",
+    })
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w") as f:
+        f.write(line1 + "\n" + line2 + "\n")
+        path = f.name
+    try:
+        trace = Trace.from_jsonl(path)
+        assert [i.doc_id for i in trace.ingests] == ["d1", "d1-rev2"]
+        assert trace.ingests[0].content == "original"
+        assert trace.ingests[1].content == "revised"
+    finally:
+        os.unlink(path)

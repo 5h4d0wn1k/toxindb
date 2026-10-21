@@ -1,43 +1,31 @@
 # Changelog
 
-All notable changes to toxindb are recorded here.
+All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-> **No tagged release exists yet.** Everything below is unreleased work on
-> `main`. The package version in `pyproject.toml` reads `1.0.0`, but no `1.0.0`
-> has been published — do not install from a tag expecting this content. The
-> first release will be cut once the open `deep-review:` findings with High
-> severity are closed.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.0/).
 
 ## [Unreleased]
 
 ### Added
 
-- Analysis engine with 12 retrieval-time poisoning heuristics, `TX-001`–`TX-012`
-  (demand concentration, recency anomaly, embedding clusters, canary resurgence,
-  provenance mismatch, bulk-ingest pulses, query/doc mismatch, double retrieval,
-  source cartels, drifted authority, new-namespace flash, quarantine).
-- Trace model and deterministic generator, with three bundled example traces
-  (`clean_trace.jsonl`, `poison_trace.jsonl`, `canary_trace.jsonl`).
-- Canary lifecycle — plant and monitor retrieval-time canary claims, with
-  deterministic seeding.
-- Provenance attestation audit: signature coverage per source, owner/source
-  consistency, multi-owner sources, and shared-signature clustering. Note that
-  unsigned docs are only flagged when the same source *also* has signed
-  documents — a wholly unsigned source is currently missed (#8).
-- Report renderer producing Markdown and JSON, plus a JSONL alert stream.
-- `toxindb` CLI: `monitor`, `canary`, `provenance`, `report`, `demo`.
-- Test suite covering every heuristic (each with both a poison-trace test
-  that fires and a clean-trace test that stays quiet), trace I/O, canaries,
-  provenance, reports, and the CLI. 139 tests at the `1.0.0` baseline; 166 with
-  the `canary --plant` regressions fixed above and their closing fences.
-- GitHub Actions CI on `ubuntu-latest`, running the suite and the offline demo
-  across Python 3.10–3.13, plus gates that make the documented promises
-  checkable: a no-network `ast` scan, a determinism gate that diffs two demo
-  runs, a gate that executes every runnable command in the README, and
-  "teeth" suites that prove each of those gates can actually fail.
+- **`toxindb demo` command.** Reproducible, offline demo that prints a
+  red/amber/green verdict plus concrete, per-alert evidence (retrieved doc ids,
+  timestamps, content snippets) for `examples/traces/poison_trace.jsonl`, with
+  a deterministic `--seed` and `--json` for machine consumption.
+- **Pluggable detection registry + config.** `toxindb detect` now loads
+  `~/.config/toxindb/config.toml` (and `TOXINDB_CONFIG`) to enable/disable
+  heuristics, set thresholds, and toggle outputs. Registry validates ids and
+  surfaces unknown keys with suggestions.
+- **Sliding windows and session tracking.** `--window-hours` on `detect`,
+  `--window` presets (`smoke`/`nightly`/`full`), and first-class `session_id` on
+  `QueryEvent` so cross-query correlation survives offline runs.
+- **HTML reports and benchmarks scaffold.** `toxindb report` emits a static
+  self-contained HTML with per-alert evidence; `toxindb bench` can replay
+  traces and print JSON timings (no network calls).
+- **CI gates and a "teeth" suite.** GitHub Actions run ruff, mypy, pytest,
+  bandit, a dependency audit, and docs build on every push/PR; the new
+  `tests/test_teeth_*` suites that prove each of those gates can actually fail.
 - Educational-use documentation set: `ETHICS.md`, `SCOPE.md`, `SECURITY.md`,
   `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `AUTHORS.md`, `NOTICE.md`.
 - Bug and feature issue templates, a PR template, `CODEOWNERS`, and
@@ -54,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 000-query trace measured 33.7 s before and 0.17 s after. The withdrawn
   METRICS.md replay claim was restated with the measured numbers and the
   remaining TX-003 quadratic term.
+
+- **`Trace.from_jsonl` rejects duplicate ingest `doc_id`s instead of silently
+  discarding provenance.** Every `doc_id`-keyed map in `heuristics.py` is
+  last-write-wins, so a trace that re-ingested a document under an existing
+  `doc_id` silently dropped the earlier record — including the signed original
+  that proved the document was legitimate — with no alert anywhere. The parse
+  boundary now raises `ValueError` naming the `doc_id` and both line numbers,
+  telling the operator to assign a distinct `doc_id` per revision.
 
 - **`canary --plant` no longer overwrites the trace it was pointed at.** The
   output path was derived with `trace_path.replace(".jsonl", ...)`, and
@@ -86,33 +82,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docstring and comment corrections where a claim was not true: the plant
   timestamp defect was never about TX-004, which substring-matches canary text
   and does no timestamp arithmetic at all.
-
-### Changed
-
-- `--demo` is accepted as a global flag as well as a subcommand, so the
-  documented and CI-invoked forms behave identically.
-- CI installs `pytest` explicitly and invokes `python3 -m pytest` for
-  interpreter-compatibility.
-
-### Known issues
-
-These are tracked as open issues and are **not** fixed in the current tree.
-See the [v1.0 hardening milestone](https://github.com/5h4d0wn1k/toxindb/milestone/1) for
-current status.
-
-- **A wholly unsigned source is invisible to both the provenance audit and
-  TX-010.** `provenance.py` only reports an unsigned doc when that source also
-  has a signed peer, so a source with no signatures at all is never flagged.
-  This is the primary supply-chain signal, and a unit test currently asserts
-  the silence (#8).
-- `SECURITY.md` directs vulnerability reports to a GitHub `users.noreply`
-  address, which cannot receive mail (#15).
-- `CONTRIBUTING.md` instructs `pip install -e ".[dev]"`, but `pyproject.toml`
-  defines no `dev` extra.
-- Several heuristics undercount or miscount under specific trace shapes
-  (see `CRT` and `DAT` issues in the backlog).
-- `package-data` glob in `pyproject.toml` does not match the bundled traces
-  under a wheel build.
-- `METRICS.md` and the README cite a test count that has drifted from the
-  actual suite size.
-

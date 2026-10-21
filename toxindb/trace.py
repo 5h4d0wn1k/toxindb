@@ -55,6 +55,7 @@ class Trace:
     @classmethod
     def from_jsonl(cls, path: str, strict: bool = False) -> "Trace":
         trace = cls()
+        ingest_doc_lines: dict = {}
         try:
             with open(path, "r") as f:
                 for lineno, line in enumerate(f, 1):
@@ -70,8 +71,19 @@ class Trace:
                     rtype = record.get("type")
                     if rtype == "ingest":
                         try:
+                            doc_id = record["doc_id"]
+                            first_line = ingest_doc_lines.get(doc_id)
+                            if first_line is not None:
+                                raise ValueError(
+                                    f"{path}:{lineno}: duplicate ingest doc_id {doc_id!r} "
+                                    f"(first ingested on line {first_line}) - re-ingesting a "
+                                    "document under an existing doc_id silently discards the "
+                                    "earlier record's provenance; assign a distinct doc_id "
+                                    "per revision"
+                                )
+                            ingest_doc_lines[doc_id] = lineno
                             trace.ingests.append(IngestEvent(
-                                doc_id=record["doc_id"],
+                                doc_id=doc_id,
                                 source=record["source"],
                                 owner=record["owner"],
                                 namespace=record["namespace"],
