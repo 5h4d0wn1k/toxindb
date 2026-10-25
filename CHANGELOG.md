@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TX-002 and TX-003 no longer rescan quadratically (#43).** The recency
+  anomaly's prior-demand count was a triple-nested scan (queries x queries x
+  docs x slots) and the embedding-cluster detector re-tokenised both documents
+  for every pair of every query. Prior demand now comes from an inverted index
+  of retrieving queries, and token vectors are computed once per document;
+  output is byte-identical (asserted by reference-implementation tests). A
+  4 000-query trace measured 33.7 s before and 0.17 s after. The withdrawn
+  METRICS.md replay claim was restated with the measured numbers and the
+  remaining TX-003 quadratic term.
+
 - **`canary --plant` no longer overwrites the trace it was pointed at.** The
   output path was derived with `trace_path.replace(".jsonl", ...)`, and
   `str.replace` takes no occurrence count: with no `.jsonl` in the path it was
