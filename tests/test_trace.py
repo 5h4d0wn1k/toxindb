@@ -112,3 +112,101 @@ def test_trace_query_defaults():
     q = QueryEvent(query_id="q1", query_text="q", timestamp=1.0)
     assert q.retrieved_doc_ids == []
     assert q.output_text == ""
+
+
+def test_from_jsonl_rejects_duplicate_ingest_doc_id():
+    """Duplicate ingest doc_id must not silently discard provenance (#31)."""
+    line1 = json.dumps({
+        "type": "ingest", "doc_id": "d1", "source": "legit-src", "owner": "alice",
+        "namespace": "ns", "timestamp": 1000.0, "content": "original", "signature": "sig:good",
+    })
+    line2 = json.dumps({
+        "type": "ingest", "doc_id": "d1", "source": "evil-src", "owner": "mallory",
+        "namespace": "ns", "timestamp": 1001.0, "content": "poisoned",
+    })
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w") as f:
+        f.write(line1 + "\n" + line2 + "\n")
+        path = f.name
+    try:
+        try:
+            Trace.from_jsonl(path)
+            raise AssertionError("expected ValueError for duplicate ingest doc_id")
+        except ValueError as e:
+            assert "duplicate ingest doc_id 'd1'" in str(e)
+            assert "line 1" in str(e)
+            assert ":2:" in str(e)
+    finally:
+        os.unlink(path)
+
+
+def test_from_jsonl_accepts_reingest_under_distinct_doc_id():
+    """A revised document is fine as long as each revision keeps its own doc_id."""
+    line1 = json.dumps({
+        "type": "ingest", "doc_id": "d1", "source": "legit-src", "owner": "alice",
+        "namespace": "ns", "timestamp": 1000.0, "content": "original",
+    })
+    line2 = json.dumps({
+        "type": "ingest", "doc_id": "d1-rev2", "source": "legit-src", "owner": "alice",
+        "namespace": "ns", "timestamp": 1001.0, "content": "revised",
+    })
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w") as f:
+        f.write(line1 + "\n" + line2 + "\n")
+        path = f.name
+    try:
+        trace = Trace.from_jsonl(path)
+        assert [i.doc_id for i in trace.ingests] == ["d1", "d1-rev2"]
+        assert trace.ingests[0].content == "original"
+        assert trace.ingests[1].content == "revised"
+    finally:
+        os.unlink(path)
+
+
+def _ingest(doc_id):
+    return IngestEvent(doc_id=doc_id, source="s", owner="o", namespace="ns",
+                        timestamp=1.0, content="c")
+
+
+def test_trace_construction_rejects_duplicate_ingest_doc_id():
+    """The doc_id uniqueness invariant holds however the Trace is built (#31)."""
+    try:
+        Trace(ingests=[_ingest("d1"), _ingest("d1")])
+        raise AssertionError("expected ValueError for duplicate ingest doc_id")
+    except ValueError as e:
+        assert "duplicate ingest doc_id" in str(e)
+
+
+def test_duplicate_doc_id_check_normalizes_variants():
+    """'1' vs 1, whitespace, case and NFC/NFD spellings must all collide."""
+    for first, second in [("1", 1), ("d1 ", "d1"), ("D1", "d1"),
+                          ("doc-\u00e9", "doc-e\u0301")]:
+        try:
+            Trace(ingests=[_ingest(first), _ingest(second)])
+            raise AssertionError(
+                f"expected duplicate rejection for {first!r} vs {second!r}")
+        except ValueError as e:
+            assert "duplicate ingest doc_id" in str(e)
+
+
+def test_from_jsonl_normalizes_doc_id_before_duplicate_check():
+    """from_jsonl compares canonical doc_id keys, not raw values."""
+    line1 = json.dumps({
+        "type": "ingest", "doc_id": "D1", "source": "s", "owner": "o",
+        "namespace": "ns", "timestamp": 1000.0, "content": "original",
+    })
+    line2 = json.dumps({
+        "type": "ingest", "doc_id": "d1 ", "source": "evil", "owner": "m",
+        "namespace": "ns", "timestamp": 1001.0, "content": "poisoned",
+    })
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w") as f:
+        f.write(line1 + "\n" + line2 + "\n")
+        path = f.name
+    try:
+        try:
+            Trace.from_jsonl(path)
+            raise AssertionError("expected ValueError for duplicate ingest doc_id")
+        except ValueError as e:
+            assert "duplicate ingest doc_id" in str(e)
+            assert "line 1" in str(e)
+            assert ":2:" in str(e)
+    finally:
+        os.unlink(path)
