@@ -2,8 +2,21 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
+
+
+def _canonical_doc_id(value) -> str:
+    """Canonical comparison key for ingest ``doc_id`` uniqueness.
+
+    Stringified, NFC-normalized, stripped and casefolded, so variants that
+    denote the same document collide instead of slipping past a raw-key
+    duplicate check: ``"D1"`` vs ``"d1"``, trailing whitespace, NFC vs NFD
+    forms, and ``1`` vs ``"1"``. ``doc_id`` is nominally a ``str``, but this
+    also tolerates a JSON file that carried the id as another scalar type.
+    """
+    return unicodedata.normalize("NFC", str(value)).strip().casefold()
 
 
 @dataclass
@@ -52,6 +65,32 @@ class Trace:
     queries: List[QueryEvent] = field(default_factory=list)
     canaries: List[CanaryClaim] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._reject_duplicate_ingest_doc_ids(self.ingests)
+
+    @staticmethod
+    def _reject_duplicate_ingest_doc_ids(ingests: List[IngestEvent]) -> None:
+        """Enforce the ingest doc_id uniqueness invariant at the model level.
+
+        Runs from ``__post_init__`` so a trace built as
+        ``Trace(ingests=[...])`` (or deserialized by ``api.analyze_trace_obj``
+        callers and other in-memory paths) is rejected exactly like one read
+        by ``from_jsonl``; it cannot reach the last-write-wins doc_id maps in
+        ``heuristics.py``.
+        """
+        seen: dict = {}
+        for index, ingest in enumerate(ingests):
+            key = _canonical_doc_id(ingest.doc_id)
+            first_index = seen.get(key)
+            if first_index is not None:
+                raise ValueError(
+                    f"duplicate ingest doc_id {ingest.doc_id!r} (ingest index "
+                    f"{first_index} already used it) - re-ingesting a document "
+                    "under an existing doc_id silently discards the earlier "
+                    "record's provenance; assign a distinct doc_id per revision"
+                )
+            seen[key] = index
+
     @classmethod
     def from_jsonl(cls, path: str, strict: bool = False) -> "Trace":
         trace = cls()
@@ -72,7 +111,8 @@ class Trace:
                     if rtype == "ingest":
                         try:
                             doc_id = record["doc_id"]
-                            first_line = ingest_doc_lines.get(doc_id)
+                            doc_key = _canonical_doc_id(doc_id)
+                            first_line = ingest_doc_lines.get(doc_key)
                             if first_line is not None:
                                 raise ValueError(
                                     f"{path}:{lineno}: duplicate ingest doc_id {doc_id!r} "
@@ -81,7 +121,7 @@ class Trace:
                                     "earlier record's provenance; assign a distinct doc_id "
                                     "per revision"
                                 )
-                            ingest_doc_lines[doc_id] = lineno
+                            ingest_doc_lines[doc_key] = lineno
                             trace.ingests.append(IngestEvent(
                                 doc_id=doc_id,
                                 source=record["source"],

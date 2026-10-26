@@ -59,8 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last-write-wins, so a trace that re-ingested a document under an existing
   `doc_id` silently dropped the earlier record — including the signed original
   that proved the document was legitimate — with no alert anywhere. The parse
-  boundary now raises `ValueError` naming the `doc_id` and both line numbers,
-  telling the operator to assign a distinct `doc_id` per revision.
+  boundary raises `ValueError` naming the `doc_id` and both line numbers,
+  and the same invariant is enforced in `Trace.__post_init__`, so an
+  in-memory `Trace(ingests=[...])` (or any other construction path) is
+  rejected too. `doc_id`s are compared after NFC normalization, stripping,
+  casefolding and string coercion, so `"D1"` vs `"d1"`, stray whitespace,
+  `1` vs `"1"` and NFD spellings cannot slip past. The error tells the
+  operator to assign a distinct `doc_id` per revision.
 
 - **`canary --plant` no longer overwrites the trace it was pointed at.** The
   output path was derived with `trace_path.replace(".jsonl", ...)`, and
